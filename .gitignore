@@ -1,0 +1,54 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Packaging and build outputs
+build/
+dist/
+*.egg-info/
+
+# Jupyter and notebooks
+.ipynb_checkpoints/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment and local secrets
+.env
+.env.*
+*.local
+
+# Logs and runtime outputs
+*.log
+logs/
+runs/
+workdir/
+workspace/
+
+# ML artifacts and large generated files
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npz
+*.npy
+
+# Local data and metadata exports
+data/
+datasets/
+metadata/
