@@ -37,6 +37,8 @@ Thumbs.db
 *.log
 logs/
 runs/
+centralized_runs/
+federated_runs/
 workdir/
 workspace/
 

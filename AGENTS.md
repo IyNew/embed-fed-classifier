@@ -2,24 +2,47 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a Python workflow for federated EMBED image classification with NVFlare, MONAI, and PyTorch.
+This repository contains Python workflows for EMBED image classification with NVFlare, MONAI, and PyTorch. Federated and centralized training entry points are kept in separate directories, with shared model/config utilities at the repository root.
 
-- `job.py` is the federated job launcher. It reads server configuration, builds the initial model, assigns client scripts, and runs the simulator.
-- `client.py` contains client training, evaluation, data loading, transforms, and FL send/receive logic.
+- `federated/job.py` is the federated job launcher. It reads server configuration, builds the initial model, assigns client scripts, and runs the simulator.
+- `federated/client.py` contains client training, evaluation, manifest/path data loading, transforms, and FL send/receive logic.
+- `federated/config.yml` is the server/job configuration. `federated/client_config.yml` controls datasets, optimization, transforms, and personalization.
+- `centralized/train_centralized.py` is the standalone centralized trainer/evaluator.
+- `centralized/centralized_config.yml` controls the centralized manifest input, model, optimizer, transforms, epochs, and output directory.
 - `model.py` defines selectable architectures: ConvNeXt variants, ViT, and `SimpleNetwork`.
 - `utils.py` contains configuration, seeding, transforms, and collation helpers.
-- `config.yml` is the server/job configuration. `client_config.yml` controls datasets, optimization, transforms, and personalization.
 - `environment.txt` is a conda environment export. There is currently no `tests/` directory or checked-in sample data.
+
+## Data Input
+
+The current primary input format is the prepared manifest CSV:
+
+- `data_csv`: `/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/first_model_trainig.csv`
+- `cleaned_data_root`: `/mnt/c/Data/EMBED/embed_cleaned`
+
+Both pipelines expect manifest columns:
+
+- `model_split`: split assignment. Use the configured split names, currently `train`, `validation`, and `test`.
+- `binary_label`: `benign` or `malignant`, mapped to labels `0` and `1`.
+- `image_path_suffix`: preferred relative path under `cleaned_data_root`.
+- `output_relpath`: fallback relative path when `image_path_suffix` is unavailable.
+- `loc_num`: site/client identifier for federated training.
+
+Use `model_split` for split assignment rather than physical folder names, because rows with `model_split=test` can still point to a path containing `train`. The prepared NIfTI slices are grayscale 2D images stored with a singleton depth dimension; training transforms squeeze that singleton axis before 2D resize/augmentation.
+
+For federated manifest input, `federated/job.py` assigns clients by `loc_num` from `client_list`. Each client trains and validates on its own site rows. `federated/client_config.yml` controls whether test evaluation is `global` across all test rows or `local` to the client site.
 
 ## Build, Test, and Development Commands
 
 - `conda create --name embed-fed --file environment.txt`: recreate the pinned environment.
 - `conda activate embed-fed`: activate the environment before running scripts.
-- `python job.py -c config.yml`: run the configured NVFlare federated simulation.
-- `python client.py --client_cases CASE_ID --client_config_path client_config.yml`: run a client script directly; provide comma-separated case IDs for multiple cases.
-- `python -m py_compile client.py job.py model.py utils.py`: perform a lightweight syntax check without data access.
+- `python federated/job.py -c federated/config.yml`: run the configured NVFlare federated simulation.
+- `python federated/client.py --data_csv DATA_CSV --cleaned_data_root ROOT --client_site SITE --client_config_path federated/client_config.yml`: run a client script directly with manifest input.
+- `python centralized/train_centralized.py -c centralized/centralized_config.yml`: run centralized training.
+- `python centralized/train_centralized.py -c centralized/centralized_config.yml --check-data-only`: validate the centralized manifest/path compatibility without training.
+- `python -m py_compile federated/client.py federated/job.py centralized/train_centralized.py model.py utils.py`: perform a lightweight syntax check without data access.
 
-Update absolute paths in `config.yml` and `client_config.yml` before running on a new machine.
+Update absolute paths in `federated/config.yml`, `federated/client_config.yml`, and `centralized/centralized_config.yml` before running on a new machine.
 
 ## Coding Style & Naming Conventions
 
@@ -27,7 +50,7 @@ Use Python 3 with 4-space indentation. Keep functions and variables in `snake_ca
 
 ## Testing Guidelines
 
-No automated test suite is currently present. For changes that do not require data, run `python -m py_compile client.py job.py model.py utils.py`. For training or data-path changes, run a small simulation with reduced `num_rounds`, `local_epochs`, and `client_list`. New tests should live under `tests/` and use `test_*.py` naming.
+No automated test suite is currently present. For changes that do not require data, run `python -m py_compile federated/client.py federated/job.py centralized/train_centralized.py model.py utils.py`. For training or data-path changes, run a small simulation with reduced `num_rounds`, `local_epochs`, and `client_list`, or run centralized training with `--epochs 1 --num-workers 0 --batch-size 4`. New tests should live under `tests/` and use `test_*.py` naming.
 
 ## Commit & Pull Request Guidelines
 

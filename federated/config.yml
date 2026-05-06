@@ -3,18 +3,26 @@ recipe: fedavg
 n_clients: 4 
 client_list: [1, 2, 5, 6] # only 4 largest sites
 num_rounds: 50
-client_script: client.py 
-workdir: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/workdir/workdir_exp40_decentralized_training_Akis_cases_class_weights" # working directory to save logs and models
+client_script: "federated/client.py"
+workdir: "./federated_runs/workdir_exp_manifest_fedavg" # working directory to save logs and models
 
 # Client configuration
 batch_size: 128
 learning_rate: 0.0001
-client_config_path: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/client_config.yml"
+client_config_path: "federated/client_config.yml"
 
 # Data configuration
-train_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/train/original"
-test_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/test"
-meta_data_path: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/metadata/EMBED_cleaned_metadata_hope_loc_num.csv"
+data_csv: "/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/first_model_trainig.csv"
+cleaned_data_root: "/mnt/c/Data/EMBED/embed_cleaned"
+splits:
+  train: "train"
+  validation: "validation"
+  test: "test"
+
+# Legacy path-scanning inputs. Used only when data_csv is empty.
+train_dataset_path: ""
+test_dataset_path: ""
+meta_data_path: ""
 
 
 # Model configuration

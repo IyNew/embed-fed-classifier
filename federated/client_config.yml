@@ -2,6 +2,11 @@
 # Dataset
 dataset: Dataset # CacheDataset
 cache_rate: 1
+splits:
+  train: "train"
+  validation: "validation"
+  test: "test"
+test_scope: "global" # global evaluates all manifest test rows; local restricts test rows to the client loc_num
 
 # dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_clean_per_site/"
 train_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/train/original"

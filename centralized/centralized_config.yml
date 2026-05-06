@@ -1,0 +1,90 @@
+# Data configuration
+data_csv: "/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/first_model_trainig.csv"
+cleaned_data_root: "/mnt/c/Data/EMBED/embed_cleaned"
+workdir: "./centralized_runs/convnext_tiny"
+
+splits:
+  train: "train"
+  validation: "validation"
+  test: "test"
+
+seed: 0
+dataset: "Dataset"
+cache_rate: 1
+
+dataloader:
+  batch_size: 128
+  num_workers: 10
+  shuffle: true
+  pin_memory: true
+
+epochs: 50
+val_interval: 1
+save_metric: "balanced_accuracy"
+
+optimizer:
+  name: "Adam"
+  lr_backbone: 0.00001
+  lr_finetune: 0.0001
+  betas: [0.9, 0.999]
+  epsilon: 0.00000008
+  weight_decay: 0.00005
+
+loss:
+  name: "CrossEntropyLoss"
+  label_smoothing: 0.1
+  class_weights: true
+
+model:
+  name: "ConvNeXtTiny"
+  num_classes: 2
+  pretrained: true
+  dropout: 0.5
+
+train_transforms:
+  LoadImaged_im:
+    keys: ["image"]
+    ensure_channel_first: true
+  ScaleIntensityd:
+    keys: ["image"]
+  Orientationd:
+    keys: ["image"]
+    axcodes: "RAS"
+    as_closest_canonical: true
+  ResizeWithPadOrCropd:
+    keys: ["image"]
+    spatial_size: [256, 256]
+  RandFlipd_x:
+    keys: ["image"]
+    prob: 0.2
+    spatial_axis: 0
+  RandFlipd_y:
+    keys: ["image"]
+    prob: 0.2
+    spatial_axis: 1
+  RandRotated:
+    keys: ["image"]
+    prob: 0.2
+    range_x: [-0.8, 0.8]
+    range_y: [-0.8, 0.8]
+    mode: "bilinear"
+  RandAffined:
+    keys: ["image"]
+    prob: 0.2
+    rotate_range: [0.2]
+    scale_range: [0.2]
+    mode: "bilinear"
+
+eval_transforms:
+  LoadImaged_im:
+    keys: ["image"]
+    ensure_channel_first: true
+  ScaleIntensityd:
+    keys: ["image"]
+  Orientationd:
+    keys: ["image"]
+    axcodes: "RAS"
+    as_closest_canonical: true
+  ResizeWithPadOrCropd:
+    keys: ["image"]
+    spatial_size: [256, 256]
