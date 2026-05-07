@@ -16,7 +16,7 @@ test_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_bi
 # Dataloader - to be optimized for training speed, depending of the GPU memory
 dataloader:
   batch_size: 128
-  num_workers: 10
+  num_workers: 4
   shuffle: true
   pin_memory: true
 

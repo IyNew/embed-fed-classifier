@@ -1,5 +1,6 @@
 import argparse
 import csv
+import gc
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import nvflare.client as flare
+import psutil
 
 from pathlib import Path
 from nvflare.fuel.utils.log_utils import get_script_logger
@@ -70,6 +72,53 @@ def save_site_metrics(metrics_path, metrics):
         json.dump(metrics, f, indent=2, allow_nan=True)
 
 
+def cleanup_round_memory():
+    try:
+        from nvflare.fuel.utils.memory_utils import cleanup_memory
+        cleanup_memory(cuda_empty_cache=torch.cuda.is_available())
+    except ImportError:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def log_system_state(tag: str) -> None:
+    """Log RAM and GPU VRAM state to help diagnose OOM crashes between rounds."""
+    parts = []
+
+    try:
+        vm = psutil.virtual_memory()
+        proc_rss = psutil.Process(os.getpid()).memory_info().rss
+        parts.append(
+            f"RAM {vm.used / 1e9:.1f}/{vm.total / 1e9:.1f} GB "
+            f"({vm.percent:.0f}% used, {vm.available / 1e9:.1f} GB free) | "
+            f"process RSS {proc_rss / 1e6:.0f} MB"
+        )
+    except Exception as e:
+        parts.append(f"RAM unavailable ({e})")
+
+    try:
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(dev)
+            alloc = torch.cuda.memory_allocated(dev)
+            reserved = torch.cuda.memory_reserved(dev)
+            total = props.total_memory
+            parts.append(
+                f"GPU[{dev}] {props.name} | "
+                f"VRAM {alloc / 1e9:.2f} GB alloc / "
+                f"{reserved / 1e9:.2f} GB reserved / "
+                f"{total / 1e9:.1f} GB total "
+                f"({(total - reserved) / 1e9:.2f} GB free)"
+            )
+        else:
+            parts.append("GPU CUDA not available")
+    except Exception as e:
+        parts.append(f"GPU unavailable ({e})")
+
+    logger.info(f"[sysinfo {tag}] {' | '.join(parts)}")
+
+
 class SqueezeSingletonDepthd:
     def __init__(self, keys):
         self.keys = keys
@@ -99,6 +148,9 @@ def define_parser():
     parser.add_argument("--client_config_path", type=str, default="./client_config.yml", nargs="?")
     parser.add_argument("--client_cases", type=str, default="", nargs="?")
     parser.add_argument("--workdir", type=str, default=Training_ROOT, nargs="?")
+    parser.add_argument("--round_offset", type=int, default=0, nargs="?")
+    parser.add_argument("--total_target_rounds", type=int, default=0, nargs="?")
+    parser.add_argument("--single_task_exit", action="store_true")
 
     return parser.parse_args()
 
@@ -219,6 +271,48 @@ def class_weights_from_records(train_records):
     return torch.tensor([total / (2 * benign), total / (2 * malignant)])
 
 
+def filter_resume_metrics(site_metrics, round_offset):
+    if round_offset <= 0:
+        return site_metrics
+    site_metrics["rounds"] = [
+        record for record in site_metrics.get("rounds", [])
+        if int(record.get("round", -1)) < round_offset
+    ]
+    site_metrics["global_test"] = [
+        record for record in site_metrics.get("global_test", [])
+        if int(record.get("round", -1)) < round_offset
+    ]
+    return site_metrics
+
+
+def load_or_create_site_metrics(metrics_path, initial_metrics, round_offset=0):
+    if metrics_path.exists():
+        try:
+            with open(metrics_path, "r") as f:
+                existing_metrics = json.load(f)
+            for key, value in initial_metrics.items():
+                if key not in existing_metrics:
+                    existing_metrics[key] = value
+            existing_metrics["device"] = initial_metrics["device"]
+            existing_metrics["data"] = initial_metrics["data"]
+            existing_metrics.setdefault("rounds", [])
+            existing_metrics.setdefault("global_test", [])
+            return filter_resume_metrics(existing_metrics, round_offset)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return initial_metrics
+
+
+def best_recorded_validation_metric(site_metrics, default):
+    best_metric = default
+    for round_record in site_metrics.get("rounds", []):
+        for epoch_record in round_record.get("epochs", []):
+            validation = epoch_record.get("validation")
+            if validation and validation.get("balanced_accuracy") is not None:
+                best_metric = max(best_metric, validation["balanced_accuracy"])
+    return best_metric
+
+
 def add_resize_if_configured(transforms, transform_config):
     if "ResizeWithPadOrCropd" in transform_config:
         transforms.append(SqueezeSingletonDepthd(keys=["image"]))
@@ -275,7 +369,7 @@ def evaluate(model_args, input_weights, val_loader, criterion=None):
     )
 
 def main():
-    # # Define local parameters
+    log_system_state("subprocess_start")
     args = define_parser()
 
     train_dataset_path = args.train_dataset_path
@@ -285,6 +379,8 @@ def main():
     local_config_path = args.client_config_path
     client_model_path = args.client_model_path
     global_model_path = args.global_model_path
+    round_offset = int(args.round_offset or 0)
+    total_target_rounds = int(args.total_target_rounds or 0)
     workdir = Path(args.workdir)
     if not workdir.is_absolute():
         workdir = REPO_ROOT / workdir
@@ -341,10 +437,13 @@ def main():
     print(f"Using batch size: {batch_size}")
     print(f"Using learning rate: {lr}")
 
-    # print("Before hitting breakpoint")
-    # import pdb;
-    # pdb.set_trace()
-    # or use breakpoint() 
+    # Initialize NVFlare first so that any subsequent exception (data loading,
+    # dataset construction, etc.) is reported back via the NVFlare protocol
+    # rather than silently killing the subprocess and causing a fatal DXO error
+    # that aborts the entire federated job.
+    flare.init()
+    client_id = flare.get_site_name()
+    log_system_state(f"flare_init ({client_id})")
 
     if args.data_csv:
         records = load_manifest_records(
@@ -377,14 +476,10 @@ def main():
         train_dataset = CacheDataset(data=train_dict, transform=train_transforms, cache_rate=local_config['cache_rate'])
         val_dataset = CacheDataset(data=val_dict, transform=val_transforms, cache_rate=local_config['cache_rate'])
         test_dataset = CacheDataset(data=test_dict, transform=val_transforms, cache_rate=local_config['cache_rate'])
-
-    # # Initialize NVFlare client
-    flare.init() 
-    client_id = flare.get_site_name()
     site_workdir = Path(workdir) / client_id
     site_workdir.mkdir(parents=True, exist_ok=True)
     metrics_path = site_workdir / "metrics.json"
-    site_metrics = {
+    initial_site_metrics = {
         "site": client_id,
         "client_site": args.client_site,
         "device": str(DEVICE),
@@ -408,6 +503,7 @@ def main():
         "rounds": [],
         "global_test": [],
     }
+    site_metrics = load_or_create_site_metrics(metrics_path, initial_site_metrics, round_offset=round_offset)
     save_site_metrics(metrics_path, site_metrics)
 
     logger.info(f"({flare.get_site_name()}) Number of training samples: {len(train_dataset)}")
@@ -432,8 +528,8 @@ def main():
     model_args = local_config.get('model') if local_config.get('model') else error_raise("model_args must be provided")
     net = get_model(model_args)
 
-    local_epochs = local_config['local_epochs']
-    best_metric = local_config['save_model_when']
+    base_local_epochs = local_config['local_epochs']
+    best_metric = best_recorded_validation_metric(site_metrics, local_config['save_model_when'])
 
     while flare.is_running():
 
@@ -442,20 +538,31 @@ def main():
 
         if flare.is_train():
             round_start = time.perf_counter()
-            logger.info(f"({client_id}) current_round={input_model.current_round}, total_rounds={input_model.total_rounds}")
+            nvflare_round = int(input_model.current_round)
+            # NVFlare sets current_round = start_round + local_round, so it already
+            # reflects the absolute round number when start_round=round_offset was passed
+            # to the FedAvg controller in job.py.
+            effective_round = nvflare_round
+            effective_total_rounds = total_target_rounds or (round_offset + int(input_model.total_rounds))
+            log_system_state(f"round_{effective_round}_start ({client_id})")
+            logger.info(
+                f"({client_id}) current_round={effective_round}, total_rounds={effective_total_rounds} "
+                f"(nvflare_round={nvflare_round}, resumed_rounds={input_model.total_rounds})"
+            )
             net.load_state_dict(input_model.params) # Load received global model weights
 
-            if input_model.current_round > 0 and client_id == 'site-1':
+            if effective_round > 0 and client_id == 'site-1':
                 logger.info(f"({client_id}) Performing testing with current global model before local training...")
                 test_metrics = evaluate(model_args, net.state_dict(), test_loader)
-                test_metrics["round"] = int(input_model.current_round)
+                test_metrics["round"] = int(effective_round)
+                test_metrics["nvflare_round"] = int(nvflare_round)
                 site_metrics["global_test"].append(test_metrics)
                 save_site_metrics(metrics_path, site_metrics)
                 logger.info(f"({client_id}) -- Balanced accuracy on test set: {test_metrics['balanced_accuracy']:.4f}")
                 logger.info(f"({client_id}) -- Specificity on test set: {test_metrics['specificity']:.4f}")
                 logger.info(f"({client_id}) -- Sensitivity on test set: {test_metrics['sensitivity']:.4f}")
                 logger.info(f"({client_id}) -- AUC on test set: {test_metrics['auc']:.4f}")
-                logger.info(f"Saving global model to {global_model_path}_{input_model.current_round}...")
+                logger.info(f"Saving global model to {global_model_path}_{effective_round}...")
                 # torch.save(net.state_dict(), f"{global_model_path}_{input_model.current_round}")
                 best_metric = test_metrics["balanced_accuracy"]  # Update best metric based on test set performance
                                                                                
@@ -508,19 +615,22 @@ def main():
 
             # # Send model to device
             net.to(DEVICE)
-            steps = local_epochs * len(train_loader)
+            round_local_epochs = 40 if local_config.get('personalized', False) and effective_round == 19 else base_local_epochs
+            steps = round_local_epochs * len(train_loader)
 
             training_loss = []
-            logger.info(f"({client_id}) Starting Training for {local_epochs} epochs...")
+            logger.info(f"({client_id}) Starting Training for {round_local_epochs} epochs...")
 
-            local_epochs = 40 if local_config.get('personalized', False) and input_model.current_round == 19 else local_epochs  # If personalized and best metric is high, train for more epochs
             round_metrics = {
-                "round": int(input_model.current_round),
-                "total_rounds": int(input_model.total_rounds),
-                "local_epochs": int(local_epochs),
+                "round": int(effective_round),
+                "nvflare_round": int(nvflare_round),
+                "total_rounds": int(effective_total_rounds),
+                "resumed_total_rounds": int(input_model.total_rounds),
+                "local_epochs": int(round_local_epochs),
                 "epochs": [],
             }
-            for epoch in range(local_epochs):  # loop over the dataset multiple times
+            last_validation_metrics = None
+            for epoch in range(round_local_epochs):  # loop over the dataset multiple times
                 epoch_start = time.perf_counter()
                 logger.info(f"-------------------------------------------")
                 logger.info(f"({client_id}) Epoch {epoch + 1}...")
@@ -588,14 +698,15 @@ def main():
                     logger.info(f"({client_id}) -- Specificity on validation set: {local_metrics['specificity']:.4f}")
                     logger.info(f"({client_id}) -- Sensitivity on validation set: {local_metrics['sensitivity']:.4f}")
                     logger.info(f"({client_id}) -- AUC on validation set: {local_metrics['auc']:.4f}")
+                    last_validation_metrics = local_metrics
                     if local_metrics["balanced_accuracy"] > best_metric:
-                        logger.info(f"({client_id}) New best model found {local_metrics['balanced_accuracy']:.4f} at round {input_model.current_round} (previous best was {best_metric:.4f})")
+                        logger.info(f"({client_id}) New best model found {local_metrics['balanced_accuracy']:.4f} at round {effective_round} (previous best was {best_metric:.4f})")
                         best_metric = local_metrics["balanced_accuracy"]
-                    logger.info(f"Saving model to {client_model_path}_{input_model.current_round}...")
+                    logger.info(f"Saving model to {client_model_path}_{effective_round}...")
 
                 if (epoch+1) % 5 == 0:
-                    logger.info(f"({client_id}) Saving model to {workdir}/{client_id}/embed_net_round_{input_model.current_round}_epoch_{epoch+1}.pth...")
-                    torch.save(net.state_dict(), f"{workdir}/{client_id}/embed_net_round_{input_model.current_round}_epoch_{epoch+1}.pth")
+                    logger.info(f"({client_id}) Saving model to {workdir}/{client_id}/embed_net_round_{effective_round}_epoch_{epoch+1}.pth...")
+                    torch.save(net.state_dict(), f"{workdir}/{client_id}/embed_net_round_{effective_round}_epoch_{epoch+1}.pth")
                 round_metrics["epochs"].append(epoch_metrics)
                 save_site_metrics(metrics_path, site_metrics)
 
@@ -604,14 +715,37 @@ def main():
             round_metrics["duration"] = format_duration(round_metrics["duration_seconds"])
             site_metrics["rounds"].append(round_metrics)
             save_site_metrics(metrics_path, site_metrics)
+            log_system_state(f"round_{effective_round}_end ({client_id})")
 
+            # Move model to CPU and capture weights before releasing GPU resources.
             output_model = flare.FLModel(
                 params=net.cpu().state_dict(),
-                # metrics={"metric": global_model_metric},
+                metrics={
+                    "validation": last_validation_metrics["balanced_accuracy"] if last_validation_metrics else math.nan,
+                    "accuracy": last_validation_metrics["balanced_accuracy"] if last_validation_metrics else math.nan,
+                    "balanced_accuracy": last_validation_metrics["balanced_accuracy"] if last_validation_metrics else math.nan,
+                    "specificity": last_validation_metrics["specificity"] if last_validation_metrics else math.nan,
+                    "sensitivity": last_validation_metrics["sensitivity"] if last_validation_metrics else math.nan,
+                    "auc": last_validation_metrics.get("auc", math.nan) if last_validation_metrics else math.nan,
+                },
                 meta={"NUM_STEPS_CURRENT_ROUND": steps},
             )
 
+            # Explicitly free GPU memory before sending, so the CUDA context is as
+            # clean as possible when this subprocess exits via os._exit(0).
+            # os._exit bypasses PyTorch's atexit CUDA teardown, so we do it manually.
+            optimizer.zero_grad(set_to_none=True)
+            del optimizer, criterion, net
+            del train_loader, val_loader, test_loader
+            del train_dataset, val_dataset, test_dataset
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
             flare.send(output_model)
+            del output_model
+            cleanup_round_memory()
+            if args.single_task_exit:
+                os._exit(0)
 
         # elif flare.is_evaluate():
         #     global_model_metric = evaluate(net, input_model.params)

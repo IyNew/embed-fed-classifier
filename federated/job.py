@@ -3,10 +3,14 @@ import argparse
 import json
 import math
 import pandas as pd
+import shlex
+import shutil
 import sys
 import time
+import torch
 
-from nvflare.app_opt.pt.job_config.fed_avg import FedAvgJob
+from nvflare.app_common.workflows.fedavg import FedAvg
+from nvflare.app_opt.pt.job_config.base_fed_job import BaseFedJob
 from nvflare.job_config.script_runner import ScriptRunner
 from nvflare.fuel.utils.log_utils import get_script_logger
 from pathlib import Path
@@ -39,9 +43,95 @@ def resolve_path(path_value, base_dir):
     if path.is_absolute():
         return path
     repo_path = REPO_ROOT / path
-    if repo_path.exists():
+    if repo_path.exists() or path.parts[:1] in {("federated_runs",), ("federated",), ("centralized",)}:
         return repo_path
     return base_dir / path
+
+
+def preserve_resume_checkpoint(checkpoint_path, workdir, completed_round, logger):
+    preserve_dir = Path(workdir).parent / "resume_checkpoints"
+    preserve_dir.mkdir(parents=True, exist_ok=True)
+    preserved_path = preserve_dir / f"round_{completed_round}_FL_global_model.pt"
+    if checkpoint_path.resolve() != preserved_path.resolve():
+        shutil.copy2(checkpoint_path, preserved_path)
+        logger.info(f"Copied resume checkpoint to stable path: {preserved_path}")
+    return preserved_path
+
+
+def normalize_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def load_resume_state(model, config, logger):
+    resume_config = config.get("resume") or {}
+    if not normalize_bool(resume_config.get("enabled"), default=False):
+        return {
+            "enabled": False,
+            "round_offset": 0,
+            "executed_rounds": int(config.get("num_rounds") or 0),
+            "total_target_rounds": int(config.get("num_rounds") or 0),
+        }
+
+    checkpoint_path = resolve_path(resume_config.get("checkpoint_path"), Path(config.get("workdir")).parent)
+    if checkpoint_path is None or not checkpoint_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint does not exist: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+        meta_props = checkpoint.get("meta_props", {})
+    else:
+        state_dict = checkpoint
+        meta_props = {}
+
+    completed_round = int(resume_config.get("completed_round", meta_props.get("current_round", -1)))
+    total_target_rounds = int(resume_config.get("total_target_rounds", config.get("num_rounds")))
+    expected_aggregated = int(config.get("n_clients") or 0)
+    nr_aggregated = meta_props.get("nr_aggregated")
+    if nr_aggregated is not None and expected_aggregated and int(nr_aggregated) != expected_aggregated:
+        raise ValueError(
+            f"Resume checkpoint is not fully aggregated: nr_aggregated={nr_aggregated}, "
+            f"expected={expected_aggregated}"
+        )
+
+    model.load_state_dict(state_dict)
+    preserved_checkpoint_path = preserve_resume_checkpoint(
+        checkpoint_path=checkpoint_path,
+        workdir=config.get("workdir"),
+        completed_round=completed_round,
+        logger=logger,
+    )
+    round_offset = completed_round + 1
+    executed_rounds = total_target_rounds - round_offset
+    if executed_rounds <= 0:
+        raise ValueError(
+            f"Resume target is already complete: completed_round={completed_round}, "
+            f"total_target_rounds={total_target_rounds}"
+        )
+    config["num_rounds"] = executed_rounds
+    logger.info(
+        f"Soft-resuming from {checkpoint_path}: completed_round={completed_round}, "
+        f"round_offset={round_offset}, remaining_rounds={executed_rounds}, "
+        f"total_target_rounds={total_target_rounds}"
+    )
+    return {
+        "enabled": True,
+        "checkpoint_path": str(checkpoint_path),
+        "preserved_checkpoint_path": str(preserved_checkpoint_path),
+        "checkpoint_meta_props": meta_props,
+        "completed_round": completed_round,
+        "round_offset": round_offset,
+        "executed_rounds": executed_rounds,
+        "total_target_rounds": total_target_rounds,
+        "effective_round_start": round_offset,
+        "effective_round_end": total_target_rounds - 1,
+    }
 
 
 def build_manifest_client_cases(config, logger):
@@ -105,7 +195,7 @@ def summarize_manifest_by_client(config):
     return summary
 
 
-def write_run_metrics(config, client_list, duration_seconds, simulator_settings):
+def write_run_metrics(config, client_list, duration_seconds, simulator_settings, resume_state):
     workdir = Path(config.get("workdir"))
     sites = {}
     global_test = []
@@ -123,22 +213,25 @@ def write_run_metrics(config, client_list, duration_seconds, simulator_settings)
             enriched["site"] = site_name
             global_test.append(enriched)
 
-    num_rounds = config.get("num_rounds", 0) or 0
+    executed_rounds = int(config.get("num_rounds", 0) or 0)
+    total_target_rounds = int(resume_state.get("total_target_rounds", executed_rounds) or executed_rounds)
     metrics = {
         "summary": {
             "recipe": config.get("recipe"),
-            "num_rounds": num_rounds,
+            "num_rounds": total_target_rounds,
+            "executed_rounds": executed_rounds,
             "client_list": client_list,
             "data_csv": config.get("data_csv"),
             "cleaned_data_root": config.get("cleaned_data_root"),
             "workdir": config.get("workdir"),
             "simulator": simulator_settings,
+            "resume": resume_state,
             "split_counts_by_site": summarize_manifest_by_client(config) if config.get("data_csv") else {},
         },
         "duration_seconds": float(duration_seconds),
         "duration": format_duration(duration_seconds),
-        "average_round_seconds": float(duration_seconds / num_rounds) if num_rounds else math.nan,
-        "average_round_duration": format_duration(duration_seconds / num_rounds) if num_rounds else None,
+        "average_round_seconds": float(duration_seconds / executed_rounds) if executed_rounds else math.nan,
+        "average_round_duration": format_duration(duration_seconds / executed_rounds) if executed_rounds else None,
         "sites": sites,
         "global_test": global_test,
     }
@@ -190,8 +283,14 @@ if __name__ == "__main__":
     config['client_script'] = str(train_script)
     if config.get("data_csv"):
         config["data_csv"] = str(resolve_path(config.get("data_csv"), config_dir))
-    os.environ.setdefault("TORCH_HOME", str(Path(config.get("workdir")) / "torch_cache"))
+    torch_home = Path(os.environ.get("TORCH_HOME", Path(config.get("workdir")) / "torch_cache"))
+    if not torch_home.is_absolute():
+        torch_home = REPO_ROOT / torch_home
+    os.environ["TORCH_HOME"] = str(torch_home)
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    # Limit glibc memory arenas to reduce RSS fragmentation across FL rounds.
+    # NVFlare's own memory_utils.py recommends MALLOC_ARENA_MAX=2 for client processes.
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
     os.environ["PYTHONPATH"] = (
         str(REPO_ROOT)
         if not os.environ.get("PYTHONPATH")
@@ -208,7 +307,6 @@ if __name__ == "__main__":
     save_config(client_config, os.path.join(experiment_config_dir, 'client_config.yml'))
     
     n_clients = config.get('n_clients')
-    num_rounds = config.get('num_rounds')   
     train_script = train_script_for_runner
     
     seed = config.get('seed', 0)
@@ -225,8 +323,18 @@ if __name__ == "__main__":
         else:
             logger.warning(f"Pretrained model path {pretrained_model_path} does not exist. Proceeding without loading pretrained weights.")
 
+    resume_state = load_resume_state(model, config, logger)
+    num_rounds = config.get('num_rounds')
+
     if config.get('recipe') == 'fedavg':
-        job = FedAvgJob(name='fedavg', n_clients=n_clients, num_rounds=num_rounds, initial_model=model)
+        job = BaseFedJob(name='fedavg', initial_model=model, min_clients=n_clients)
+        controller = FedAvg(
+            num_clients=n_clients,
+            num_rounds=num_rounds,
+            start_round=resume_state.get("round_offset", 0),
+            persistor_id=job.comp_ids["persistor_id"],
+        )
+        job.to_server(controller)
 
     client_list = config.get('client_list')
     if config.get("data_csv"):
@@ -245,6 +353,8 @@ if __name__ == "__main__":
             "--client_config_path", config.get('client_config_path'),
             "--workdir", str(Path(config.get('workdir'))),
             "--client_site", str(site),
+            "--round_offset", str(resume_state.get("round_offset", 0)),
+            "--total_target_rounds", str(resume_state.get("total_target_rounds", num_rounds)),
         ]
         if config.get("data_csv"):
             script_args.extend([
@@ -257,17 +367,34 @@ if __name__ == "__main__":
                 "--train_dataset_path", config.get('train_dataset_path'),
                 "--test_dataset_path", config.get('test_dataset_path'),
             ])
-        script_args = " ".join(script_args)
+        simulator_config = config.get("simulator") or {}
+        executor_mode = simulator_config.get("executor_mode", "in_process")
+        if executor_mode not in {"in_process", "external_per_task"}:
+            raise ValueError("simulator.executor_mode must be 'in_process' or 'external_per_task'")
+        if executor_mode == "external_per_task":
+            script_args.append("--single_task_exit")
+
+        script_args = shlex.join(script_args)
         executor = ScriptRunner(
             script=train_script,
             script_args=script_args,
-            launch_external_process=True,
+            launch_external_process=executor_mode == "external_per_task",
             command=f"{sys.executable} -u",
-            launch_once=True,
+            launch_once=False,
+            shutdown_timeout=float(simulator_config.get("shutdown_timeout", 30.0)),
+            memory_gc_rounds=int(simulator_config.get("memory_gc_rounds", 1)),
+            cuda_empty_cache=normalize_bool(simulator_config.get("cuda_empty_cache"), default=True),
         )
         job.to(executor, f"site-{site}")
 
-    simulator_settings = {"threads": 1, "gpu": "0"}
+    simulator_config = config.get("simulator") or {}
+    simulator_settings = {
+        "threads": int(simulator_config.get("threads", 1)),
+        "gpu": str(simulator_config.get("gpu", "0")),
+        "executor_mode": simulator_config.get("executor_mode", "in_process"),
+        "memory_gc_rounds": int(simulator_config.get("memory_gc_rounds", 1)),
+        "cuda_empty_cache": normalize_bool(simulator_config.get("cuda_empty_cache"), default=True),
+    }
     start_time = time.perf_counter()
     job.simulator_run(
         workspace=config.get('workdir'),
@@ -275,7 +402,7 @@ if __name__ == "__main__":
         gpu=simulator_settings["gpu"],
     )
     duration_seconds = time.perf_counter() - start_time
-    run_metrics = write_run_metrics(config, client_list, duration_seconds, simulator_settings)
+    run_metrics = write_run_metrics(config, client_list, duration_seconds, simulator_settings, resume_state)
     logger.info(
         f"Federated run completed in {run_metrics['duration']} "
         f"(avg_round={run_metrics['average_round_duration']})"

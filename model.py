@@ -1,10 +1,40 @@
+import importlib
+import sys
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from monai.networks.nets import ViT
-from torchvision.models.convnext import ConvNeXt, CNBlockConfig
-from torchvision.models import convnext_tiny, convnext_small, convnext_base
+
+
+def _is_transient_torchvision_import_error(exc):
+    message = str(exc)
+    return (
+        "partially initialized module 'torchvision'" in message
+        or ("torchvision" in message and "extension" in message)
+    )
+
+
+def _clear_torchvision_modules():
+    for name in list(sys.modules):
+        if name == "torchvision" or name.startswith("torchvision."):
+            sys.modules.pop(name, None)
+
+
+def _get_torchvision_builder(builder_name, attempts=3):
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            models = importlib.import_module("torchvision.models")
+            return getattr(models, builder_name)
+        except (AttributeError, ImportError) as exc:
+            last_exc = exc
+            if not _is_transient_torchvision_import_error(exc) or attempt == attempts - 1:
+                raise
+            _clear_torchvision_modules()
+            time.sleep(1.0 + attempt)
+    raise last_exc
     
 
 class FedViT(nn.Module):
@@ -60,6 +90,7 @@ class MyConvNeXtTiny(nn.Module):
     def __init__(self, num_classes=2, pretrained=True, dropout=0.3):
         super().__init__()
         self.pretrained = pretrained
+        convnext_tiny = _get_torchvision_builder("convnext_tiny")
         if self.pretrained:
             self.model = convnext_tiny(num_classes=1000, dropout=dropout, weights='IMAGENET1K_V1')
             # Adapt first conv for single channel
@@ -105,6 +136,7 @@ class MyConvNeXtSmall(nn.Module):
     def __init__(self, num_classes=2, pretrained=True, dropout=0.4):
         super().__init__()
         self.pretrained = pretrained
+        convnext_small = _get_torchvision_builder("convnext_small")
         if self.pretrained:
             self.model = convnext_small(num_classes=1000, dropout=dropout, weights='IMAGENET1K_V1')
             # Adapt first conv for single channel
@@ -150,6 +182,7 @@ class MyConvNeXtBase(nn.Module):
     def __init__(self, num_classes=2, pretrained=True, dropout=0.3):
         super().__init__()
         self.pretrained = pretrained
+        convnext_base = _get_torchvision_builder("convnext_base")
         if self.pretrained:
             self.model = convnext_base(num_classes=1000, dropout=dropout, weights='IMAGENET1K_V1')
             # Adapt first conv for single channel
