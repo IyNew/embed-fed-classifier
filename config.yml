@@ -1,25 +1,26 @@
 # Server configuration
 recipe: fedavg
 n_clients: 4 
-client_list: [1, 2, 5, 6] # only 4 largest sites
+client_list: [6, 5, 2, 1] # only 4 largest sites
 num_rounds: 50
-client_script: client.py 
-workdir: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/workdir/workdir_exp40_decentralized_training_Akis_cases_class_weights" # working directory to save logs and models
+client_script: "client.py"
+client_python_command: "/home/wenytang/nvflare_example/venv/bin/python -u"
+workdir: "/home/wenytang/nvflare_example/new_input/federated_runs/fed_training_live" # working directory to save logs and models
 
 # Client configuration
 batch_size: 128
 learning_rate: 0.0001
-client_config_path: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/client_config.yml"
+client_config_path: "/home/wenytang/nvflare_example/new_input/client_config.yml"
 
 # Data configuration
-train_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/train/original"
-test_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/test"
-meta_data_path: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/metadata/EMBED_cleaned_metadata_hope_loc_num.csv"
+train_dataset_path: "/mnt/c/Data/EMBED/embed_grouped/train/original"
+test_dataset_path: "/mnt/c/Data/EMBED/embed_grouped/test"
+meta_data_path: "/mnt/c/Data/EMBED/embed_grouped/tables/legacy_metadata.csv"
 
 
 # Model configuration
 pretrained: false
-pretrained_model_path: "/mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/workdir/workdir_exp37_decentralized_training_Akis_cases_class_weights_personalized/EMBED_net_global.pth_15"
+pretrained_model_path: ""
 # model:
 #   name: 'ViT'
 #   in_channels: 1

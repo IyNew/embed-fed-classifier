@@ -1,10 +1,18 @@
 import argparse
+import json
+import os
 import random
+import time
+
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 import torch
+torch._disable_dynamo = lambda fn=None, recursive=True: fn if fn is not None else (lambda f: f)
 import torch.nn as nn
 import torch.optim as optim
 import nvflare.client as flare
 
+from pathlib import Path
 from nvflare.fuel.utils.log_utils import get_script_logger
 from monai.transforms import (Compose, LoadImaged, ScaleIntensityd, RandAdjustContrastd, Orientationd, RandGaussianSmoothd, RandFlipd, RandRotated,
                              RandShiftIntensityd, RandGaussianNoised, ThresholdIntensityd, RandAffined)
@@ -30,12 +38,95 @@ def define_parser():
     parser.add_argument("--client_model_path", type=str, default=f"{Training_ROOT}/embed_net.pth", nargs="?")
     parser.add_argument("--global_model_path", type=str, default=f"{Training_ROOT}/embed_net_global.pth", nargs="?")
     parser.add_argument("--client_config_path", type=str, default="./client_config.yml", nargs="?")
-    parser.add_argument("--client_cases", type=str, required=True, nargs="?")
+    parser.add_argument("--client_cases", type=str, default="", nargs="?")
+    parser.add_argument("--client_cases_file", type=str, default="", nargs="?")
     parser.add_argument("--workdir", type=str, default=Training_ROOT, nargs="?")
 
     return parser.parse_args()
 
-def evaluate(model_args, input_weights, val_loader):
+
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def label_counts(cases):
+    benign = len([c for c in cases if "benign" in str(c)])
+    malignant = len([c for c in cases if "malignant" in str(c)])
+    return {
+        "total": len(cases),
+        "benign": benign,
+        "malignant": malignant,
+    }
+
+
+def safe_divide(numerator, denominator):
+    return numerator / denominator if denominator else None
+
+
+def json_safe(value):
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def metric_text(value):
+    return f"{value:.4f}" if value is not None else "n/a"
+
+
+def calculate_metrics(labels, predictions, probs=None, loss=None):
+    if not labels:
+        return {
+            "loss": loss,
+            "balanced_accuracy": None,
+            "specificity": None,
+            "sensitivity": None,
+            "confusion_matrix": [[0, 0], [0, 0]],
+            "auc": None,
+        }
+
+    matrix = confusion_matrix(labels, predictions, labels=[0, 1])
+    tn, fp, fn, tp = matrix.ravel()
+    metrics = {
+        "loss": loss,
+        "balanced_accuracy": balanced_accuracy_score(labels, predictions),
+        "specificity": safe_divide(tn, tn + fp),
+        "sensitivity": safe_divide(tp, tp + fn),
+        "confusion_matrix": matrix.astype(int).tolist(),
+        "auc": None,
+    }
+    if probs and len(set(labels)) == 2:
+        metrics["auc"] = roc_auc_score(labels, probs)
+    return metrics
+
+
+def save_site_metrics(metrics_path, site_metrics):
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(metrics_path, "w") as f:
+        json.dump(json_safe(site_metrics), f, indent=2)
+
+
+def fl_metrics(validation_metrics):
+    if not validation_metrics:
+        return {}
+    metrics = {
+        "validation": validation_metrics.get("balanced_accuracy"),
+        "accuracy": validation_metrics.get("balanced_accuracy"),
+        "balanced_accuracy": validation_metrics.get("balanced_accuracy"),
+        "specificity": validation_metrics.get("specificity"),
+        "sensitivity": validation_metrics.get("sensitivity"),
+        "auc": validation_metrics.get("auc"),
+    }
+    return {key: json_safe(value) for key, value in metrics.items() if value is not None}
+
+
+def evaluate(model_args, input_weights, val_loader, criterion=None):
     logger.info("Evaluating model...")
     net = get_model(model_args)
     net.load_state_dict(input_weights)
@@ -46,6 +137,8 @@ def evaluate(model_args, input_weights, val_loader):
     val_ground_total = []
     all_probs = []  
     all_labels = []
+    running_loss = 0.0
+    batches = 0
 
     with torch.no_grad():
         for i, data in enumerate(val_loader, 0):
@@ -60,28 +153,27 @@ def evaluate(model_args, input_weights, val_loader):
             # plt.show()
             # continue
 
-        try:
-            outputs = net(inputs) # [0] needed only if using ViT model to get logits
+            try:
+                outputs = net(inputs) # [0] needed only if using ViT model to get logits
+                if criterion is not None:
+                    loss = criterion(outputs, labels)
+                    running_loss += loss.item()
+                    batches += 1
 
-            # Accuracy calculation
-            _, predicted_classes = torch.max(outputs.detach().cpu(), 1)
-            val_predicted_total.extend(predicted_classes.numpy().tolist())
-            val_ground_total.extend(labels.detach().cpu().numpy().tolist())
+                # Accuracy calculation
+                _, predicted_classes = torch.max(outputs.detach().cpu(), 1)
+                val_predicted_total.extend(predicted_classes.numpy().tolist())
+                val_ground_total.extend(labels.detach().cpu().numpy().tolist())
 
-            probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of positive class
-            all_probs.extend(probs.detach().cpu().numpy().tolist())
-            all_labels.extend(labels.detach().cpu().numpy().tolist())
+                probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of positive class
+                all_probs.extend(probs.detach().cpu().numpy().tolist())
+                all_labels.extend(labels.detach().cpu().numpy().tolist())
 
-        except Exception as e:
-            print(f"Error during training: {e}")
-    
-    tn, fp, fn, tp = confusion_matrix(val_ground_total, val_predicted_total).ravel()
-    balanced_accuray = balanced_accuracy_score(val_ground_total, val_predicted_total)
-    specificity = tn / (tn + fp)
-    sensitivity = tp / (tp + fn)
-    auc = roc_auc_score(all_labels, all_probs)
+            except Exception as e:
+                print(f"Error during evaluation: {e}")
 
-    return balanced_accuray, specificity, sensitivity, auc
+    eval_loss = running_loss / batches if batches else None
+    return calculate_metrics(val_ground_total, val_predicted_total, all_probs, eval_loss)
 
 def main():
     # # Define local parameters
@@ -96,9 +188,22 @@ def main():
     global_model_path = args.global_model_path
     workdir = args.workdir
 
-    local_cases = args.client_cases
-    local_cases = local_cases.split(',') # list of case IDs
+    if args.client_cases_file:
+        local_cases = [
+            case.strip()
+            for case in Path(args.client_cases_file).read_text().splitlines()
+            if case.strip()
+        ]
+    else:
+        local_cases = [case for case in args.client_cases.split(',') if case] # list of case IDs
     local_config = load_config(local_config_path)
+
+    # Initialize before expensive local data setup so subprocess launch does not time out.
+    flare.init()
+    client_id = flare.get_site_name()
+    client_site = client_id.replace("site-", "")
+    site_dir = Path(workdir) / client_id
+    metrics_path = site_dir / "metrics.json"
 
     train_transforms_config = local_config.get('train_transforms')
     eval_transforms_config = local_config.get('eval_transforms')
@@ -184,12 +289,26 @@ def main():
         val_dataset = CacheDataset(data=val_dict, transform=val_transforms, cache_rate=local_config['cache_rate'])
         test_dataset = CacheDataset(data=test_dict, transform=val_transforms, cache_rate=local_config['cache_rate'])
 
-    # # Initialize NVFlare client
-    flare.init() 
-
-    logger.info(f"({flare.get_site_name()}) Number of training samples: {len(train_dataset)}")
-    logger.info(f"({flare.get_site_name()}) Number of validation samples: {len(val_dataset)}")
-    logger.info(f"({flare.get_site_name()}) Number of test samples: {len(test_dataset)}")
+    logger.info(f"({client_id}) Number of training samples: {len(train_dataset)}")
+    logger.info(f"({client_id}) Number of validation samples: {len(val_dataset)}")
+    logger.info(f"({client_id}) Number of test samples: {len(test_dataset)}")
+    site_metrics = {
+        "site": client_id,
+        "client_site": client_site,
+        "device": str(DEVICE),
+        "data": {
+            "train": label_counts(train_cases),
+            "validation": label_counts(val_cases),
+            "test": label_counts(test_cases),
+        },
+        "class_weights": {
+            "benign": w_benign,
+            "malignant": w_malignant,
+        },
+        "rounds": [],
+        "global_test": [],
+    }
+    save_site_metrics(metrics_path, site_metrics)
 
     # # Initialize DataLoader
     train_loader = DataLoader(train_dataset, batch_size=local_config.get('dataloader').get('batch_size', 1),
@@ -209,7 +328,7 @@ def main():
     model_args = local_config.get('model') if local_config.get('model') else error_raise("model_args must be provided")
     net = get_model(model_args)
 
-    local_epochs = local_config['local_epochs']
+    configured_local_epochs = local_config['local_epochs']
     best_metric = local_config['save_model_when']
 
     while flare.is_running():
@@ -224,13 +343,17 @@ def main():
             if input_model.current_round > 0 and client_id == 'site-1':
                 logger.info(f"({client_id}) Performing testing with current global model before local training...")
                 test_metrics = evaluate(model_args, net.state_dict(), test_loader)
-                logger.info(f"({client_id}) -- Balanced accuracy on test set: {test_metrics[0]:.4f}")
-                logger.info(f"({client_id}) -- Specificity on test set: {test_metrics[1]:.4f}")
-                logger.info(f"({client_id}) -- Sensitivity on test set: {test_metrics[2]:.4f}")
-                logger.info(f"({client_id}) -- AUC on test set: {test_metrics[3]:.4f}")
+                test_metrics["round"] = input_model.current_round
+                site_metrics["global_test"].append(test_metrics)
+                save_site_metrics(metrics_path, site_metrics)
+                logger.info(f"({client_id}) -- Balanced accuracy on test set: {metric_text(test_metrics['balanced_accuracy'])}")
+                logger.info(f"({client_id}) -- Specificity on test set: {metric_text(test_metrics['specificity'])}")
+                logger.info(f"({client_id}) -- Sensitivity on test set: {metric_text(test_metrics['sensitivity'])}")
+                if test_metrics.get("auc") is not None:
+                    logger.info(f"({client_id}) -- AUC on test set: {metric_text(test_metrics['auc'])}")
                 logger.info(f"Saving global model to {global_model_path}_{input_model.current_round}...")
-                # torch.save(net.state_dict(), f"{global_model_path}_{input_model.current_round}")
-                best_metric = test_metrics[0]  # Update best metric based on test set performance
+                if test_metrics["balanced_accuracy"] is not None:
+                    best_metric = test_metrics["balanced_accuracy"]  # Update best metric based on test set performance
                                                                                
             # # Define loss function
             if local_config.get('loss'):
@@ -281,16 +404,27 @@ def main():
 
             # # Send model to device
             net.to(DEVICE)
-            steps = local_epochs * len(train_loader)
+            round_local_epochs = 40 if local_config.get('personalized', False) and input_model.current_round == 19 else configured_local_epochs
+            steps = round_local_epochs * len(train_loader)
 
             training_loss = []
-            logger.info(f"({client_id}) Starting Training for {local_epochs} epochs...")
+            logger.info(f"({client_id}) Starting Training for {round_local_epochs} epochs...")
 
-            local_epochs = 40 if local_config.get('personalized', False) and input_model.current_round == 19 else local_epochs  # If personalized and best metric is high, train for more epochs
-            for epoch in range(local_epochs):  # loop over the dataset multiple times
+            round_start = time.time()
+            round_metrics = {
+                "round": input_model.current_round,
+                "total_rounds": input_model.total_rounds,
+                "local_epochs": round_local_epochs,
+                "epochs": [],
+            }
+            site_metrics["rounds"].append(round_metrics)
+            latest_validation_metrics = None
+            for epoch in range(round_local_epochs):  # loop over the dataset multiple times
+                epoch_start = time.time()
                 logger.info(f"-------------------------------------------")
                 logger.info(f"({client_id}) Epoch {epoch + 1}...")
                 running_loss = 0.0
+                train_batches = 0
                 predicted_total = []
                 ground_total = []
 
@@ -324,48 +458,73 @@ def main():
                         labels = labels.detach().cpu()
                         predicted_total.extend(predicted_classes.numpy().tolist())
                         ground_total.extend(labels.numpy().tolist())
+                        running_loss += loss.item()
+                        train_batches += 1
 
                     except Exception as e:
                         print(f"({client_id}) Error during training: {e}")
 
-                    running_loss += loss.item()
-                epoch_accuracy = balanced_accuracy_score(ground_total, predicted_total)
-                epoch_confusion = confusion_matrix(ground_total, predicted_total)
-                epoch_sensitivity = epoch_confusion[1,1] / (epoch_confusion[1,1] + epoch_confusion[1,0])
-                epoch_specificity = epoch_confusion[0,0] / (epoch_confusion[0,0] + epoch_confusion[0,1])
-                epoch_loss = running_loss / len(train_loader)
+                epoch_loss = running_loss / train_batches if train_batches else None
                 training_loss.append(epoch_loss)
+                epoch_metrics = calculate_metrics(ground_total, predicted_total, loss=epoch_loss)
+                epoch_duration = time.time() - epoch_start
+                epoch_record = {
+                    "epoch": epoch + 1,
+                    "loss": epoch_metrics["loss"],
+                    "balanced_accuracy": epoch_metrics["balanced_accuracy"],
+                    "specificity": epoch_metrics["specificity"],
+                    "sensitivity": epoch_metrics["sensitivity"],
+                    "confusion_matrix": epoch_metrics["confusion_matrix"],
+                    "duration_seconds": epoch_duration,
+                    "duration": format_duration(epoch_duration),
+                }
 
-                logger.info(f"Epoch loss: {epoch_loss:.4f}")
-                logger.info(f"Epoch balanced accuracy: {epoch_accuracy:.4f}")
-                logger.info(f"Epoch specificity: {epoch_specificity:.4f}")
-                logger.info(f"Epoch sensitivity: {epoch_sensitivity:.4f}")
+                logger.info(f"Epoch loss: {metric_text(epoch_metrics['loss'])}")
+                logger.info(f"Epoch balanced accuracy: {metric_text(epoch_metrics['balanced_accuracy'])}")
+                logger.info(f"Epoch specificity: {metric_text(epoch_metrics['specificity'])}")
+                logger.info(f"Epoch sensitivity: {metric_text(epoch_metrics['sensitivity'])}")
                 logger.info(f"-------------------------------------------")
 
                 if (epoch+1) % local_config.get('val_interval', 10) == 0:
-                    local_metrics = evaluate(model_args, net.state_dict(), val_loader)
-                    logger.info(f"({client_id}) -- Balanced accuracy on validation set: {local_metrics[0]:.4f}")
-                    logger.info(f"({client_id}) -- Specificity on validation set: {local_metrics[1]:.4f}")
-                    logger.info(f"({client_id}) -- Sensitivity on validation set: {local_metrics[2]:.4f}")
-                    logger.info(f"({client_id}) -- AUC on validation set: {local_metrics[3]:.4f}")
-                    if local_metrics[0] > best_metric:
-                        logger.info(f"({client_id}) New best model found {local_metrics[0]:.4f} at round {input_model.current_round} (previous best was {best_metric:.4f})")
-                        best_metric = local_metrics[0]
-                    logger.info(f"Saving model to {client_model_path}_{input_model.current_round}...")
+                    local_metrics = evaluate(model_args, net.state_dict(), val_loader, criterion)
+                    latest_validation_metrics = local_metrics
+                    epoch_record["validation"] = local_metrics
+                    logger.info(f"({client_id}) -- Balanced accuracy on validation set: {metric_text(local_metrics['balanced_accuracy'])}")
+                    logger.info(f"({client_id}) -- Specificity on validation set: {metric_text(local_metrics['specificity'])}")
+                    logger.info(f"({client_id}) -- Sensitivity on validation set: {metric_text(local_metrics['sensitivity'])}")
+                    if local_metrics.get("auc") is not None:
+                        logger.info(f"({client_id}) -- AUC on validation set: {metric_text(local_metrics['auc'])}")
+                    if local_metrics["balanced_accuracy"] is not None and local_metrics["balanced_accuracy"] > best_metric:
+                        logger.info(f"({client_id}) New best model found {metric_text(local_metrics['balanced_accuracy'])} at round {input_model.current_round} (previous best was {best_metric:.4f})")
+                        best_metric = local_metrics["balanced_accuracy"]
+                    else:
+                        logger.info(f"({client_id}) Validation did not improve best metric {best_metric:.4f}.")
 
                 if (epoch+1) % 5 == 0:
-                    logger.info(f"({client_id}) Saving model to {workdir}/{client_id}/embed_net_round_{input_model.current_round}_epoch_{epoch+1}.pth...")
-                    torch.save(net.state_dict(), f"{workdir}/{client_id}/embed_net_round_{input_model.current_round}_epoch_{epoch+1}.pth")
+                    checkpoint_path = site_dir / f"embed_net_round_{input_model.current_round}_epoch_{epoch+1}.pth"
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"({client_id}) Saving model to {checkpoint_path}...")
+                    torch.save(net.state_dict(), checkpoint_path)
+
+                round_metrics["epochs"].append(epoch_record)
+                save_site_metrics(metrics_path, site_metrics)
 
             logger.info(f"({client_id}) Finished Training")
+            round_duration = time.time() - round_start
+            round_metrics["duration_seconds"] = round_duration
+            round_metrics["duration"] = format_duration(round_duration)
+            save_site_metrics(metrics_path, site_metrics)
 
             output_model = flare.FLModel(
                 params=net.cpu().state_dict(),
-                # metrics={"metric": global_model_metric},
+                metrics=fl_metrics(latest_validation_metrics),
                 meta={"NUM_STEPS_CURRENT_ROUND": steps},
             )
 
             flare.send(output_model)
+            logger.info(f"({client_id}) Sent training result; shutting down external task process.")
+            flare.shutdown()
+            return
 
         # elif flare.is_evaluate():
         #     global_model_metric = evaluate(net, input_model.params)

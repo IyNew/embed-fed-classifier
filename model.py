@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from monai.networks.nets import ViT
-from torchvision.models.convnext import ConvNeXt, CNBlockConfig
 from torchvision.models import convnext_tiny, convnext_small, convnext_base
     
 
@@ -57,32 +56,32 @@ class SimpleNetwork(nn.Module):
 
 
 class MyConvNeXtTiny(nn.Module):
-    def __init__(self, num_classes=2, pretrained=True, dropout=0.3):
+    def __init__(self, num_classes=2, pretrained=True, dropout=0.3, load_pretrained_weights=True):
         super().__init__()
         self.pretrained = pretrained
         if self.pretrained:
-            self.model = convnext_tiny(num_classes=1000, dropout=dropout, weights='IMAGENET1K_V1')
+            weights = 'IMAGENET1K_V1' if load_pretrained_weights else None
+            self.model = convnext_tiny(num_classes=1000, dropout=dropout, weights=weights)
             # Adapt first conv for single channel
             orig_conv = self.model.features[0][0]
             with torch.no_grad():
                 w = orig_conv.weight.data
-                if w.size(1) == 3:
-                    w_mean = w.mean(dim=1, keepdim=True)
-                    new_conv = nn.Conv2d(
-                        in_channels=1,
-                        out_channels=orig_conv.out_channels,
-                        kernel_size=orig_conv.kernel_size,
-                        stride=orig_conv.stride,
-                        padding=orig_conv.padding,
-                        dilation=orig_conv.dilation,
-                        groups=orig_conv.groups,
-                        bias=(orig_conv.bias is not None),
-                        padding_mode=getattr(orig_conv, "padding_mode", "zeros")
-                    )
-                    new_conv.weight.data.copy_(w_mean)
-                    if orig_conv.bias is not None:
-                        new_conv.bias.data.copy_(orig_conv.bias.data)
-                    self.model.features[0][0] = new_conv
+                w_mean = w.mean(dim=1, keepdim=True)
+                new_conv = nn.Conv2d(
+                    in_channels=1,
+                    out_channels=orig_conv.out_channels,
+                    kernel_size=orig_conv.kernel_size,
+                    stride=orig_conv.stride,
+                    padding=orig_conv.padding,
+                    dilation=orig_conv.dilation,
+                    groups=orig_conv.groups,
+                    bias=(orig_conv.bias is not None),
+                    padding_mode=getattr(orig_conv, "padding_mode", "zeros")
+                )
+                new_conv.weight.data.copy_(w_mean)
+                if orig_conv.bias is not None:
+                    new_conv.bias.data.copy_(orig_conv.bias.data)
+                self.model.features[0][0] = new_conv
 
             # Replace classifier with BatchNorm1d version
             previous_head_in_features = self.model.classifier[2].in_features
@@ -102,32 +101,32 @@ class MyConvNeXtTiny(nn.Module):
     
 
 class MyConvNeXtSmall(nn.Module):
-    def __init__(self, num_classes=2, pretrained=True, dropout=0.4):
+    def __init__(self, num_classes=2, pretrained=True, dropout=0.4, load_pretrained_weights=True):
         super().__init__()
         self.pretrained = pretrained
         if self.pretrained:
-            self.model = convnext_small(num_classes=1000, dropout=dropout, weights='IMAGENET1K_V1')
+            weights = 'IMAGENET1K_V1' if load_pretrained_weights else None
+            self.model = convnext_small(num_classes=1000, dropout=dropout, weights=weights)
             # Adapt first conv for single channel
             orig_conv = self.model.features[0][0]
             with torch.no_grad():
                 w = orig_conv.weight.data
-                if w.size(1) == 3:
-                    w_mean = w.mean(dim=1, keepdim=True)
-                    new_conv = nn.Conv2d(
-                        in_channels=1,
-                        out_channels=orig_conv.out_channels,
-                        kernel_size=orig_conv.kernel_size,
-                        stride=orig_conv.stride,
-                        padding=orig_conv.padding,
-                        dilation=orig_conv.dilation,
-                        groups=orig_conv.groups,
-                        bias=(orig_conv.bias is not None),
-                        padding_mode=getattr(orig_conv, "padding_mode", "zeros")
-                    )
-                    new_conv.weight.data.copy_(w_mean)
-                    if orig_conv.bias is not None:
-                        new_conv.bias.data.copy_(orig_conv.bias.data)
-                    self.model.features[0][0] = new_conv
+                w_mean = w.mean(dim=1, keepdim=True)
+                new_conv = nn.Conv2d(
+                    in_channels=1,
+                    out_channels=orig_conv.out_channels,
+                    kernel_size=orig_conv.kernel_size,
+                    stride=orig_conv.stride,
+                    padding=orig_conv.padding,
+                    dilation=orig_conv.dilation,
+                    groups=orig_conv.groups,
+                    bias=(orig_conv.bias is not None),
+                    padding_mode=getattr(orig_conv, "padding_mode", "zeros")
+                )
+                new_conv.weight.data.copy_(w_mean)
+                if orig_conv.bias is not None:
+                    new_conv.bias.data.copy_(orig_conv.bias.data)
+                self.model.features[0][0] = new_conv
 
             # Replace classifier with BatchNorm1d version
             previous_head_in_features = self.model.classifier[2].in_features
@@ -147,32 +146,32 @@ class MyConvNeXtSmall(nn.Module):
     
 
 class MyConvNeXtBase(nn.Module):
-    def __init__(self, num_classes=2, pretrained=True, dropout=0.3):
+    def __init__(self, num_classes=2, pretrained=True, dropout=0.3, load_pretrained_weights=True):
         super().__init__()
         self.pretrained = pretrained
         if self.pretrained:
-            self.model = convnext_base(num_classes=1000, dropout=dropout, weights='IMAGENET1K_V1')
+            weights = 'IMAGENET1K_V1' if load_pretrained_weights else None
+            self.model = convnext_base(num_classes=1000, dropout=dropout, weights=weights)
             # Adapt first conv for single channel
             orig_conv = self.model.features[0][0]
             with torch.no_grad():
                 w = orig_conv.weight.data
-                if w.size(1) == 3:
-                    w_mean = w.mean(dim=1, keepdim=True)
-                    new_conv = nn.Conv2d(
-                        in_channels=1,
-                        out_channels=orig_conv.out_channels,
-                        kernel_size=orig_conv.kernel_size,
-                        stride=orig_conv.stride,
-                        padding=orig_conv.padding,
-                        dilation=orig_conv.dilation,
-                        groups=orig_conv.groups,
-                        bias=(orig_conv.bias is not None),
-                        padding_mode=getattr(orig_conv, "padding_mode", "zeros")
-                    )
-                    new_conv.weight.data.copy_(w_mean)
-                    if orig_conv.bias is not None:
-                        new_conv.bias.data.copy_(orig_conv.bias.data)
-                    self.model.features[0][0] = new_conv
+                w_mean = w.mean(dim=1, keepdim=True)
+                new_conv = nn.Conv2d(
+                    in_channels=1,
+                    out_channels=orig_conv.out_channels,
+                    kernel_size=orig_conv.kernel_size,
+                    stride=orig_conv.stride,
+                    padding=orig_conv.padding,
+                    dilation=orig_conv.dilation,
+                    groups=orig_conv.groups,
+                    bias=(orig_conv.bias is not None),
+                    padding_mode=getattr(orig_conv, "padding_mode", "zeros")
+                )
+                new_conv.weight.data.copy_(w_mean)
+                if orig_conv.bias is not None:
+                    new_conv.bias.data.copy_(orig_conv.bias.data)
+                self.model.features[0][0] = new_conv
 
             # Replace classifier with BatchNorm1d version
             previous_head_in_features = self.model.classifier[2].in_features
@@ -195,10 +194,25 @@ def get_model(model_args):
     if model_args.get('name') == 'ViT':
         return FedViT() # ViT returns logits and hidden states (tuple of 2 elements)
     elif model_args.get('name') == 'ConvNeXtTiny':
-        return MyConvNeXtTiny(num_classes=model_args.get('num_classes', 2), pretrained=model_args.get('pretrained', True), dropout=model_args.get('dropout', 0.3))
+        return MyConvNeXtTiny(
+            num_classes=model_args.get('num_classes', 2),
+            pretrained=model_args.get('pretrained', True),
+            dropout=model_args.get('dropout', 0.3),
+            load_pretrained_weights=model_args.get('load_pretrained_weights', True),
+        )
     elif model_args.get('name') == 'ConvNeXtSmall':
-        return MyConvNeXtSmall(num_classes=model_args.get('num_classes', 2), pretrained=model_args.get('pretrained', True), dropout=model_args.get('dropout', 0.3))
+        return MyConvNeXtSmall(
+            num_classes=model_args.get('num_classes', 2),
+            pretrained=model_args.get('pretrained', True),
+            dropout=model_args.get('dropout', 0.3),
+            load_pretrained_weights=model_args.get('load_pretrained_weights', True),
+        )
     elif model_args.get('name') == 'ConvNeXtBase':
-        return MyConvNeXtBase(num_classes=model_args.get('num_classes', 2), pretrained=model_args.get('pretrained', True), dropout=model_args.get('dropout', 0.3))
+        return MyConvNeXtBase(
+            num_classes=model_args.get('num_classes', 2),
+            pretrained=model_args.get('pretrained', True),
+            dropout=model_args.get('dropout', 0.3),
+            load_pretrained_weights=model_args.get('load_pretrained_weights', True),
+        )
     else:
         return SimpleNetwork()

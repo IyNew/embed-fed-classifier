@@ -3,10 +3,10 @@
 dataset: Dataset # CacheDataset
 cache_rate: 1
 
-# dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_clean_per_site/"
-train_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/train/original"
-test_dataset_path: "/mnt/d/Users/kokouk/Data/EMBED/EMBED_binary_256x256/EMBED_binary_256x256/test"
-# meta_data_path: /mnt/d/Users/kokouk/Projects/EMBEDFedClassifier/metadata/EMBED_cleaned_metadata.csv
+# dataset_path: "/mnt/c/Data/EMBED/embed_grouped"
+train_dataset_path: "/mnt/c/Data/EMBED/embed_grouped/train/original"
+test_dataset_path: "/mnt/c/Data/EMBED/embed_grouped/test"
+# meta_data_path: "/mnt/c/Data/EMBED/embed_grouped/tables/legacy_metadata.csv"
 
 # Dataloader - to be optimized for training speed, depending of the GPU memory
 dataloader:
@@ -19,7 +19,7 @@ dataloader:
 save_model_when: 0 # Metric has to be greater than this value for the model to be saved
 local_epochs: 5 # number of local epochs per client per round
 val_interval: 5
-personalized: true # If true, the model will be personalized for each client after training
+personalized: false # If true, the model will be personalized for each client after training
 personalization_epochs: 400 # number of epochs for personalization   
 
 # Optimizer

@@ -9,15 +9,14 @@ This repository contains a Python workflow for federated EMBED image classificat
 - `model.py` defines selectable architectures: ConvNeXt variants, ViT, and `SimpleNetwork`.
 - `utils.py` contains configuration, seeding, transforms, and collation helpers.
 - `config.yml` is the server/job configuration. `client_config.yml` controls datasets, optimization, transforms, and personalization.
-- `environment.txt` is a conda environment export. There is currently no `tests/` directory or checked-in sample data.
+- `/home/wenytang/nvflare_example/venv` is the project virtual environment. `environment.txt` is a conda environment export kept for reference. There is currently no `tests/` directory or checked-in sample data.
 
 ## Build, Test, and Development Commands
 
-- `conda create --name embed-fed --file environment.txt`: recreate the pinned environment.
-- `conda activate embed-fed`: activate the environment before running scripts.
-- `python job.py -c config.yml`: run the configured NVFlare federated simulation.
-- `python client.py --client_cases CASE_ID --client_config_path client_config.yml`: run a client script directly; provide comma-separated case IDs for multiple cases.
-- `python -m py_compile client.py job.py model.py utils.py`: perform a lightweight syntax check without data access.
+- `source /home/wenytang/nvflare_example/venv/bin/activate`: activate the project virtual environment before running scripts.
+- `/home/wenytang/nvflare_example/venv/bin/python job.py -c config.yml`: run the configured NVFlare federated simulation.
+- `/home/wenytang/nvflare_example/venv/bin/python client.py --client_cases CASE_ID --client_config_path client_config.yml`: run a client script directly; provide comma-separated case IDs for multiple cases.
+- `/home/wenytang/nvflare_example/venv/bin/python -m py_compile client.py job.py model.py utils.py`: perform a lightweight syntax check without data access.
 
 Update absolute paths in `config.yml` and `client_config.yml` before running on a new machine.
 
@@ -27,7 +26,7 @@ Use Python 3 with 4-space indentation. Keep functions and variables in `snake_ca
 
 ## Testing Guidelines
 
-No automated test suite is currently present. For changes that do not require data, run `python -m py_compile client.py job.py model.py utils.py`. For training or data-path changes, run a small simulation with reduced `num_rounds`, `local_epochs`, and `client_list`. New tests should live under `tests/` and use `test_*.py` naming.
+No automated test suite is currently present. For changes that do not require data, run `/home/wenytang/nvflare_example/venv/bin/python -m py_compile client.py job.py model.py utils.py`. For training or data-path changes, run a small simulation with reduced `num_rounds`, `local_epochs`, and `client_list`. New tests should live under `tests/` and use `test_*.py` naming.
 
 ## Commit & Pull Request Guidelines
 
