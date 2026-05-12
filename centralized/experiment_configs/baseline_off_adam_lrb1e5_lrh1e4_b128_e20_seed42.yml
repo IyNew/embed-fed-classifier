@@ -1,14 +1,15 @@
-# Data configuration
+# Non-DP baseline: Adam, batch=128, lr_backbone=1e-5, lr_finetune=1e-4.
+# Keeps the DP candidate's model/loss/transform regime but disables privacy.
 data_csv: "/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/first_model_trainig.csv"
 cleaned_data_root: "/mnt/c/Data/EMBED/embed_cleaned"
-workdir: "./centralized_runs/convnext_tiny"
+workdir: "./centralized_runs/baseline_off_adam_lrb1e5_lrh1e4_b128_e20_seed42"
 
 splits:
   train: "train"
   validation: "validation"
   test: "test"
 
-seed: 0
+seed: 42
 dataset: "Dataset"
 cache_rate: 1
 
@@ -18,7 +19,7 @@ dataloader:
   shuffle: true
   pin_memory: true
 
-epochs: 50
+epochs: 20
 val_interval: 1
 save_metric: "balanced_accuracy"
 
@@ -27,10 +28,10 @@ differential_privacy:
   accountant: "prv"
   secure_mode: false
   mode: "noise_multiplier"
-  noise_multiplier: 1.0
+  noise_multiplier: 0.5
   target_epsilon: null
-  target_delta: null
-  max_grad_norm: 1.0
+  target_delta: 0.00025886616515661404
+  max_grad_norm: 5.0
   poisson_sampling: true
   clipping: "flat"
   grad_sample_mode: "hooks"

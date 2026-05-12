@@ -19,6 +19,20 @@ if str(REPO_ROOT) not in sys.path:
 LABEL_MAP = {"benign": 0, "malignant": 1}
 REQUIRED_COLUMNS = {"model_split", "binary_label"}
 PATH_COLUMNS = ("image_path_suffix", "output_relpath")
+DEFAULT_DP_CONFIG = {
+    "enabled": False,
+    "accountant": "prv",
+    "secure_mode": False,
+    "mode": "noise_multiplier",
+    "noise_multiplier": 1.0,
+    "target_epsilon": None,
+    "target_delta": None,
+    "max_grad_norm": 1.0,
+    "poisson_sampling": True,
+    "clipping": "flat",
+    "grad_sample_mode": "hooks",
+    "fix_modules": True,
+}
 
 
 class SqueezeSingletonDepthd:
@@ -378,6 +392,154 @@ def build_criterion(config, class_weights, device):
     ).to(device)
 
 
+def get_dp_config(config):
+    dp_config = DEFAULT_DP_CONFIG.copy()
+    dp_config.update(config.get("differential_privacy") or {})
+    return dp_config
+
+
+def load_opacus():
+    try:
+        from opacus import PrivacyEngine
+        from opacus.validators import ModuleValidator
+    except ImportError as exc:
+        raise ImportError(
+            "Differential privacy is enabled, but Opacus is not installed. "
+            "Install it with `pip install opacus==1.5.4` or recreate the conda "
+            "environment from environment.txt."
+        ) from exc
+    return PrivacyEngine, ModuleValidator
+
+
+def disable_stochastic_depth(model):
+    disabled = 0
+    for module in model.modules():
+        if module.__class__.__name__ == "StochasticDepth" and getattr(module, "p", 0) != 0:
+            module.p = 0.0
+            disabled += 1
+    return disabled
+
+
+def make_model_dp_compatible(config, model):
+    dp_config = get_dp_config(config)
+    if not dp_config["enabled"]:
+        return model, {"module_fixed": False, "stochastic_depth_disabled": 0}
+
+    _, module_validator = load_opacus()
+    module_fixed = False
+    stochastic_depth_disabled = disable_stochastic_depth(model)
+
+    if dp_config.get("fix_modules", True):
+        fix_and_validate = getattr(module_validator, "fix_and_validate", None)
+        if fix_and_validate is not None:
+            model = fix_and_validate(model)
+        else:
+            model = module_validator.fix(model)
+            module_validator.validate(model, strict=True)
+        module_fixed = True
+    else:
+        module_validator.validate(model, strict=True)
+
+    return model, {
+        "module_fixed": module_fixed,
+        "stochastic_depth_disabled": stochastic_depth_disabled,
+    }
+
+
+def resolve_dp_delta(dp_config, train_dataset_size):
+    if dp_config.get("target_delta") is not None:
+        return float(dp_config["target_delta"])
+    if train_dataset_size <= 0:
+        raise ValueError("Cannot infer DP target_delta from an empty training dataset.")
+    return 1.0 / float(train_dataset_size)
+
+
+def make_dp_metadata(dp_config, train_dataset_size, module_fixed):
+    if not dp_config["enabled"]:
+        return {"enabled": False}
+
+    target_delta = resolve_dp_delta(dp_config, train_dataset_size)
+    metadata = {
+        "enabled": True,
+        "accountant": dp_config["accountant"],
+        "secure_mode": bool(dp_config.get("secure_mode", False)),
+        "mode": dp_config["mode"],
+        "max_grad_norm": float(dp_config["max_grad_norm"]),
+        "poisson_sampling": bool(dp_config.get("poisson_sampling", True)),
+        "clipping": dp_config.get("clipping", "flat"),
+        "grad_sample_mode": dp_config.get("grad_sample_mode", "hooks"),
+        "fix_modules": bool(dp_config.get("fix_modules", True)),
+        "module_fixed": bool(module_fixed),
+        "stochastic_depth_disabled": 0,
+        "target_delta": target_delta,
+        "final_epsilon": None,
+        "per_epoch_epsilon": [],
+    }
+    if dp_config["mode"] == "noise_multiplier":
+        metadata["noise_multiplier"] = float(dp_config["noise_multiplier"])
+    elif dp_config["mode"] == "target_epsilon":
+        metadata["target_epsilon"] = float(dp_config["target_epsilon"])
+    return metadata
+
+
+def prepare_private_training(config, model, optimizer, train_loader, train_dataset_size):
+    dp_config = get_dp_config(config)
+    if not dp_config["enabled"]:
+        return model, optimizer, train_loader, None
+
+    if dp_config["mode"] not in {"noise_multiplier", "target_epsilon"}:
+        raise ValueError(
+            "Unsupported differential_privacy.mode: "
+            f"{dp_config['mode']}. Expected 'noise_multiplier' or 'target_epsilon'."
+        )
+
+    privacy_engine_cls, _ = load_opacus()
+    privacy_engine = privacy_engine_cls(
+        accountant=dp_config["accountant"],
+        secure_mode=dp_config.get("secure_mode", False),
+    )
+    common_kwargs = {
+        "module": model,
+        "optimizer": optimizer,
+        "data_loader": train_loader,
+        "max_grad_norm": float(dp_config["max_grad_norm"]),
+        "poisson_sampling": bool(dp_config.get("poisson_sampling", True)),
+        "clipping": dp_config.get("clipping", "flat"),
+        "grad_sample_mode": dp_config.get("grad_sample_mode", "hooks"),
+    }
+
+    if dp_config["mode"] == "noise_multiplier":
+        model, optimizer, train_loader = privacy_engine.make_private(
+            noise_multiplier=float(dp_config["noise_multiplier"]),
+            **common_kwargs,
+        )
+    else:
+        if dp_config.get("target_epsilon") is None:
+            raise ValueError(
+                "differential_privacy.target_epsilon is required when mode is 'target_epsilon'."
+            )
+        model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
+            epochs=int(config["epochs"]),
+            target_epsilon=float(dp_config["target_epsilon"]),
+            target_delta=resolve_dp_delta(dp_config, train_dataset_size),
+            **common_kwargs,
+        )
+
+    return model, optimizer, train_loader, privacy_engine
+
+
+def get_checkpoint_module(model):
+    return getattr(model, "_module", model)
+
+
+def get_epsilon(privacy_engine, delta):
+    try:
+        return float(privacy_engine.get_epsilon(delta))
+    except Exception as exc:
+        print(f"Warning: failed to compute DP epsilon: {exc}")
+        return math.nan
+
+
 def safe_divide(numerator, denominator):
     return float(numerator / denominator) if denominator else math.nan
 
@@ -491,10 +653,19 @@ def train(config, records_by_split):
 
     datasets = build_datasets(config, records_by_split)
     loaders = build_loaders(config, datasets)
-    model = get_model(config["model"]).to(device)
+    model = get_model(config["model"])
+    model, dp_model_info = make_model_dp_compatible(config, model)
+    model = model.to(device)
     class_weights = compute_class_weights(records_by_split["train"], device)
     criterion = build_criterion(config, class_weights, device)
     optimizer = build_optimizer(config, model)
+    model, optimizer, loaders["train"], privacy_engine = prepare_private_training(
+        config,
+        model,
+        optimizer,
+        loaders["train"],
+        len(datasets["train"]),
+    )
 
     best_metric_name = config.get("save_metric", "balanced_accuracy")
     best_metric = -math.inf
@@ -502,8 +673,16 @@ def train(config, records_by_split):
         "summary": summarize_records(records_by_split),
         "class_weights": [float(v) for v in class_weights.detach().cpu().numpy().tolist()],
         "device": str(device),
+        "differential_privacy": make_dp_metadata(
+            get_dp_config(config),
+            len(datasets["train"]),
+            dp_model_info["module_fixed"],
+        ),
         "epochs": [],
     }
+    metrics_history["differential_privacy"]["stochastic_depth_disabled"] = dp_model_info[
+        "stochastic_depth_disabled"
+    ]
 
     print(f"Training on {device}. Outputs will be saved to {workdir}")
     print(f"Split summary: {json.dumps(metrics_history['summary'], sort_keys=True)}")
@@ -513,6 +692,23 @@ def train(config, records_by_split):
         epoch_start = time.perf_counter()
         train_metrics = train_one_epoch(model, loaders["train"], criterion, optimizer, device)
         epoch_metrics = {"epoch": epoch, "train": train_metrics}
+        if privacy_engine is not None:
+            epsilon = get_epsilon(
+                privacy_engine,
+                metrics_history["differential_privacy"]["target_delta"],
+            )
+            epoch_metrics["differential_privacy"] = {
+                "epsilon": epsilon,
+                "delta": metrics_history["differential_privacy"]["target_delta"],
+            }
+            metrics_history["differential_privacy"]["per_epoch_epsilon"].append(
+                {"epoch": epoch, "epsilon": epsilon}
+            )
+            metrics_history["differential_privacy"]["final_epsilon"] = epsilon
+            if hasattr(optimizer, "noise_multiplier"):
+                metrics_history["differential_privacy"]["noise_multiplier"] = float(
+                    optimizer.noise_multiplier
+                )
 
         if epoch % config.get("val_interval", 1) == 0:
             validation_metrics = evaluate(model, loaders["validation"], criterion, device)
@@ -520,27 +716,36 @@ def train(config, records_by_split):
             metric_value = validation_metrics[best_metric_name]
             if not math.isnan(metric_value) and metric_value > best_metric:
                 best_metric = metric_value
-                torch.save(model.state_dict(), workdir / "best_model.pth")
+                torch.save(get_checkpoint_module(model).state_dict(), workdir / "best_model.pth")
                 metrics_history["best_epoch"] = epoch
                 metrics_history["best_validation"] = validation_metrics
 
         epoch_seconds = time.perf_counter() - epoch_start
         epoch_metrics["duration_seconds"] = epoch_seconds
         metrics_history["epochs"].append(epoch_metrics)
+        dp_status = ""
+        if privacy_engine is not None:
+            dp_status = (
+                "epsilon="
+                f"{epoch_metrics.get('differential_privacy', {}).get('epsilon', math.nan):.4f} "
+            )
         print(
             f"Epoch {epoch:03d}/{config['epochs']:03d} "
             f"train_loss={train_metrics['loss']:.4f} "
             f"train_bal_acc={train_metrics['balanced_accuracy']:.4f} "
             f"val_bal_acc={epoch_metrics.get('validation', {}).get('balanced_accuracy', math.nan):.4f} "
+            f"{dp_status}"
             f"epoch_time={format_duration(epoch_seconds)}"
         )
 
-    torch.save(model.state_dict(), workdir / "last_model.pth")
+    torch.save(get_checkpoint_module(model).state_dict(), workdir / "last_model.pth")
     test_metrics = evaluate(model, loaders["test"], criterion, device)
     metrics_history["test"] = test_metrics
     best_model_path = workdir / "best_model.pth"
     if best_model_path.exists():
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        get_checkpoint_module(model).load_state_dict(
+            torch.load(best_model_path, map_location=device)
+        )
         best_test_metrics = evaluate(model, loaders["test"], criterion, device)
         metrics_history["best_model_test"] = best_test_metrics
     total_seconds = time.perf_counter() - training_start
@@ -579,7 +784,9 @@ def evaluate_checkpoint(config, records_by_split, checkpoint_path, split):
 
     datasets = build_datasets(config, records_by_split)
     loaders = build_loaders(config, datasets)
-    model = get_model(config["model"]).to(device)
+    model = get_model(config["model"])
+    model, _ = make_model_dp_compatible(config, model)
+    model = model.to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     class_weights = compute_class_weights(records_by_split["train"], device)
     criterion = build_criterion(config, class_weights, device)

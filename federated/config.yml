@@ -4,18 +4,18 @@ n_clients: 4
 client_list: [1, 2, 5, 6] # only 4 largest sites
 num_rounds: 50
 client_script: "federated/client.py"
-workdir: "./federated_runs/workdir_exp_manifest_fedavg" # working directory to save logs and models
+workdir: "./federated_runs/50_round_exp_manifest_fedavg" # working directory to save logs and models
 
 simulator:
   executor_mode: "external_per_task" # fresh client process per task; fallback: in_process
-  threads: 1
+  threads: 0 # 1
   gpu: "0"
   memory_gc_rounds: 1
   cuda_empty_cache: true
   shutdown_timeout: 30
 
 resume:
-  enabled: true
+  enabled: false
   checkpoint_path: "federated_runs/resume_checkpoints/round_5_FL_global_model.pt"
   completed_round: 5
   total_target_rounds: 50

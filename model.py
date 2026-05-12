@@ -120,7 +120,7 @@ class MyConvNeXtTiny(nn.Module):
             self.model.classifier = nn.Sequential(
                 nn.Flatten(),  # Important for BatchNorm1d
                 nn.BatchNorm1d(previous_head_in_features),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Dropout(p=dropout),
             )
             self.head = nn.Linear(previous_head_in_features, num_classes)
@@ -166,7 +166,7 @@ class MyConvNeXtSmall(nn.Module):
             self.model.classifier = nn.Sequential(
                 nn.Flatten(),  # Important for BatchNorm1d
                 nn.BatchNorm1d(previous_head_in_features),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Dropout(p=dropout),
             )
             self.head = nn.Linear(previous_head_in_features, num_classes)
@@ -212,7 +212,7 @@ class MyConvNeXtBase(nn.Module):
             self.model.classifier = nn.Sequential(
                 nn.Flatten(),  # Important for BatchNorm1d
                 nn.BatchNorm1d(previous_head_in_features),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Dropout(p=dropout),
             )
             self.head = nn.Linear(previous_head_in_features, num_classes)

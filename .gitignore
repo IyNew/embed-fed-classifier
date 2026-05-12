@@ -54,3 +54,6 @@ workspace/
 data/
 datasets/
 metadata/
+
+
+.watchdogrc

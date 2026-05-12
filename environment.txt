@@ -288,6 +288,7 @@ nibabel=5.3.2=pyha770c72_1
 nsight-compute=2024.1.1.4=0
 numpy=2.2.6=pypi_0
 nvflare-nightly=2.7.0rc5=pypi_0
+opacus=1.5.4=pypi_0
 nvidia-cublas-cu12=12.4.5.8=pypi_0
 nvidia-cuda-cupti-cu12=12.4.127=pypi_0
 nvidia-cuda-nvrtc-cu12=12.4.127=pypi_0
