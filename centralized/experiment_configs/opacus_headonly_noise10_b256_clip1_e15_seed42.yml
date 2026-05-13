@@ -1,35 +1,36 @@
-# Data configuration
+# Head-only DP fine-tuning baseline: noise=1.0, delta=1e-5, batch=256, clip=1.0, 15 epochs.
 data_csv: "/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/first_model_trainig.csv"
 cleaned_data_root: "/mnt/c/Data/EMBED/embed_cleaned"
-workdir: "./centralized_runs/convnext_tiny"
+workdir: "./centralized_runs/opacus_headonly_noise10_b256_clip1_e15_seed42"
 
 splits:
   train: "train"
   validation: "validation"
   test: "test"
 
-seed: 0
+seed: 42
 dataset: "Dataset"
 cache_rate: 1
 
 dataloader:
-  batch_size: 128
-  num_workers: 10
+  batch_size: 256
+  num_workers: 2
   shuffle: true
   pin_memory: true
+  read_retries: 3
+  retry_delay_seconds: 0.25
 
-epochs: 50
+epochs: 15
 val_interval: 1
 save_metric: "balanced_accuracy"
 
 differential_privacy:
-  enabled: false
+  enabled: true
   accountant: "prv"
   secure_mode: false
   mode: "noise_multiplier"
   noise_multiplier: 1.0
-  target_epsilon: null
-  target_delta: null
+  target_delta: 0.00001
   max_grad_norm: 1.0
   poisson_sampling: true
   clipping: "flat"
@@ -37,18 +38,17 @@ differential_privacy:
   fix_modules: true
 
 optimizer:
-  name: "Adam"
-  freeze_backbone: false
-  lr_backbone: 0.00001
+  name: "SGD"
+  freeze_backbone: true
+  lr_backbone: 0.0
   lr_finetune: 0.0001
-  betas: [0.9, 0.999]
-  epsilon: 0.00000008
+  momentum: 0.0
   weight_decay: 0.00005
 
 loss:
   name: "CrossEntropyLoss"
-  label_smoothing: 0.1
-  class_weights: true
+  label_smoothing: 0.0
+  class_weights: false
 
 model:
   name: "ConvNeXtTiny"

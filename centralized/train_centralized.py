@@ -341,17 +341,72 @@ def compute_class_weights(train_records, device):
     )
 
 
-def split_parameters(model):
-    backbone_params = []
-    finetune_params = []
+FINETUNE_PARAMETER_PATTERNS = ("classifier", "features.0.0", "head")
+
+
+def is_finetune_parameter(name):
+    return any(pattern in name for pattern in FINETUNE_PARAMETER_PATTERNS)
+
+
+def classify_parameters(model):
+    parameter_groups = {"backbone": [], "finetune": []}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "classifier" in name or "features.0.0" in name or "head" in name:
-            finetune_params.append(param)
-        else:
-            backbone_params.append(param)
-    return backbone_params, finetune_params
+        group_name = "finetune" if is_finetune_parameter(name) else "backbone"
+        parameter_groups[group_name].append((name, param))
+    return parameter_groups
+
+
+def count_parameters(named_parameters):
+    return int(sum(param.numel() for _, param in named_parameters))
+
+
+def split_parameters(model):
+    parameter_groups = classify_parameters(model)
+    return (
+        [param for _, param in parameter_groups["backbone"]],
+        [param for _, param in parameter_groups["finetune"]],
+    )
+
+
+def configure_trainable_parameters(config, model):
+    optimizer_config = config.get("optimizer", {})
+    freeze_backbone = bool(optimizer_config.get("freeze_backbone", False))
+    initial_groups = classify_parameters(model)
+
+    if freeze_backbone:
+        for _, param in initial_groups["backbone"]:
+            param.requires_grad = False
+
+    final_groups = classify_parameters(model)
+    frozen_backbone = initial_groups["backbone"] if freeze_backbone else []
+
+    return {
+        "freeze_backbone": freeze_backbone,
+        "frozen_parameter_count": count_parameters(frozen_backbone),
+        "trainable_parameter_count": count_parameters(
+            final_groups["backbone"] + final_groups["finetune"]
+        ),
+        "frozen_parameter_names": [name for name, _ in frozen_backbone],
+        "trainable_parameter_names": [
+            name for name, _ in final_groups["backbone"] + final_groups["finetune"]
+        ],
+        "groups": {
+            "backbone": {
+                "lr": optimizer_config.get("lr_backbone"),
+                "trainable": bool(final_groups["backbone"]),
+                "parameter_count": count_parameters(final_groups["backbone"]),
+                "parameter_names": [name for name, _ in final_groups["backbone"]],
+            },
+            "finetune": {
+                "lr": optimizer_config.get("lr_finetune"),
+                "trainable": bool(final_groups["finetune"]),
+                "parameter_count": count_parameters(final_groups["finetune"]),
+                "parameter_names": [name for name, _ in final_groups["finetune"]],
+            },
+        },
+    }
 
 
 def build_optimizer(config, model):
@@ -359,10 +414,18 @@ def build_optimizer(config, model):
 
     backbone_params, finetune_params = split_parameters(model)
     optimizer_config = config["optimizer"]
-    param_groups = [
-        {"params": backbone_params, "lr": optimizer_config.get("lr_backbone")},
-        {"params": finetune_params, "lr": optimizer_config.get("lr_finetune")},
-    ]
+    param_groups = []
+    if backbone_params:
+        param_groups.append(
+            {"params": backbone_params, "lr": optimizer_config.get("lr_backbone")}
+        )
+    if finetune_params:
+        param_groups.append(
+            {"params": finetune_params, "lr": optimizer_config.get("lr_finetune")}
+        )
+
+    if not param_groups:
+        raise ValueError("No trainable parameters available for optimizer.")
 
     if optimizer_config["name"] == "Adam":
         return optim.Adam(
@@ -658,6 +721,7 @@ def train(config, records_by_split):
     model = model.to(device)
     class_weights = compute_class_weights(records_by_split["train"], device)
     criterion = build_criterion(config, class_weights, device)
+    optimizer_metadata = configure_trainable_parameters(config, model)
     optimizer = build_optimizer(config, model)
     model, optimizer, loaders["train"], privacy_engine = prepare_private_training(
         config,
@@ -673,6 +737,7 @@ def train(config, records_by_split):
         "summary": summarize_records(records_by_split),
         "class_weights": [float(v) for v in class_weights.detach().cpu().numpy().tolist()],
         "device": str(device),
+        "optimizer": optimizer_metadata,
         "differential_privacy": make_dp_metadata(
             get_dp_config(config),
             len(datasets["train"]),
@@ -686,6 +751,12 @@ def train(config, records_by_split):
 
     print(f"Training on {device}. Outputs will be saved to {workdir}")
     print(f"Split summary: {json.dumps(metrics_history['summary'], sort_keys=True)}")
+    print(
+        "Parameter freezing: "
+        f"freeze_backbone={optimizer_metadata['freeze_backbone']} "
+        f"frozen={optimizer_metadata['frozen_parameter_count']:,} "
+        f"trainable={optimizer_metadata['trainable_parameter_count']:,}"
+    )
 
     training_start = time.perf_counter()
     for epoch in range(1, config["epochs"] + 1):

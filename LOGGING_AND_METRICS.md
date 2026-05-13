@@ -336,10 +336,16 @@ centralized_runs/convnext_tiny/
   metrics.json
 ```
 
-`centralized/train_centralized.py` prints one progress line per epoch:
+`centralized/train_centralized.py` prints one progress line per epoch for regular centralized runs:
 
 ```text
 Epoch 001/050 train_loss=... train_bal_acc=... val_bal_acc=... epoch_time=...
+```
+
+Dedicated DP runs use `centralized/train_centralized_dp.py` and append epsilon to the same line:
+
+```text
+Epoch 001/050 train_loss=... train_bal_acc=... val_bal_acc=... epsilon=... epoch_time=...
 ```
 
 The script itself writes `metrics.json` at the end of training. If centralized training is launched with stdout/stderr redirection, those printed progress lines can also be captured in a file such as `train.log`.
@@ -355,6 +361,22 @@ The centralized `metrics.json` contains:
   },
   "class_weights": [],
   "device": "cuda:0",
+  "optimizer": {
+    "configured_name": "Adam",
+    "effective_name": "SGD",
+    "name_overridden_for_dp": true,
+    "freeze_backbone": false,
+    "parameter_group_lrs": {"backbone": 0.00001, "finetune": 0.0001}
+  },
+  "differential_privacy": {
+    "enabled": true,
+    "target_delta": 0.00025,
+    "noise_multiplier": 0.5,
+    "final_epsilon": 0.0,
+    "per_epoch_epsilon": [],
+    "module_fixed": true,
+    "stochastic_depth_disabled": 0
+  },
   "epochs": [
     {
       "epoch": 1,
