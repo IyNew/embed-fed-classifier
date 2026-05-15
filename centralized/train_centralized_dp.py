@@ -39,7 +39,7 @@ from train_centralized import (  # noqa: E402
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a centralized EMBED classifier with Opacus DP-SGD."
+        description="Train a centralized EMBED classifier, optionally using Opacus DP."
     )
     parser.add_argument(
         "-c",
@@ -77,10 +77,7 @@ def apply_overrides(config, args):
 def make_model_dp_compatible(config, model):
     dp_config = get_dp_config(config)
     if not dp_config["enabled"]:
-        raise ValueError(
-            "centralized/train_centralized_dp.py is for DP training only. "
-            "Use centralized/train_centralized.py for non-DP runs."
-        )
+        return model, {"module_fixed": False, "stochastic_depth_disabled": 0}
 
     _, module_validator = load_opacus()
     module_fixed = False
@@ -103,8 +100,18 @@ def make_model_dp_compatible(config, model):
     }
 
 
+def normalize_optimizer_name(name):
+    normalized = str(name or "SGD").strip().lower()
+    if normalized == "sgd":
+        return "SGD"
+    if normalized == "adam":
+        return "Adam"
+    raise ValueError(f"Unsupported optimizer: {name}")
+
+
 def configure_trainable_parameters(config, model):
     optimizer_config = config.get("optimizer", {})
+    optimizer_name = normalize_optimizer_name(optimizer_config.get("name", "SGD"))
     freeze_backbone = bool(optimizer_config.get("freeze_backbone", False))
     initial_groups = classify_parameters(model)
 
@@ -117,8 +124,8 @@ def configure_trainable_parameters(config, model):
 
     return {
         "configured_name": optimizer_config.get("name", "SGD"),
-        "effective_name": "SGD",
-        "name_overridden_for_dp": optimizer_config.get("name", "SGD") != "SGD",
+        "effective_name": optimizer_name,
+        "name_overridden_for_dp": False,
         "freeze_backbone": freeze_backbone,
         "frozen_parameter_count": count_parameters(frozen_backbone),
         "trainable_parameter_count": count_parameters(
@@ -133,6 +140,8 @@ def configure_trainable_parameters(config, model):
             "finetune": optimizer_config.get("lr_finetune"),
         },
         "momentum": float(optimizer_config.get("momentum", 0.0)),
+        "betas": [float(v) for v in optimizer_config.get("betas", [0.9, 0.999])],
+        "epsilon": float(optimizer_config.get("epsilon", 1e-8)),
         "weight_decay": float(optimizer_config.get("weight_decay", 0.0)),
         "groups": {
             "backbone": {
@@ -151,11 +160,12 @@ def configure_trainable_parameters(config, model):
     }
 
 
-def build_dp_sgd_optimizer(config, model):
+def build_optimizer(config, model):
     import torch.optim as optim
 
     backbone_params, finetune_params = split_parameters(model)
     optimizer_config = config["optimizer"]
+    optimizer_name = normalize_optimizer_name(optimizer_config.get("name", "SGD"))
     param_groups = []
     if backbone_params:
         param_groups.append(
@@ -169,11 +179,20 @@ def build_dp_sgd_optimizer(config, model):
     if not param_groups:
         raise ValueError("No trainable parameters available for optimizer.")
 
-    return optim.SGD(
-        param_groups,
-        momentum=optimizer_config.get("momentum", 0.0),
-        weight_decay=optimizer_config.get("weight_decay", 0.0),
-    )
+    if optimizer_name == "Adam":
+        return optim.Adam(
+            param_groups,
+            betas=tuple(optimizer_config.get("betas", [0.9, 0.999])),
+            eps=optimizer_config.get("epsilon", 1e-8),
+            weight_decay=optimizer_config.get("weight_decay", 0.0),
+        )
+    if optimizer_name == "SGD":
+        return optim.SGD(
+            param_groups,
+            momentum=optimizer_config.get("momentum", 0.0),
+            weight_decay=optimizer_config.get("weight_decay", 0.0),
+        )
+    raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
 
 class TransformedTupleDataset:
@@ -248,6 +267,13 @@ def build_torch_loaders(config, datasets):
 
 
 def make_dp_metadata(dp_config, train_dataset_size, dp_model_info):
+    if not dp_config["enabled"]:
+        return {
+            "enabled": False,
+            "module_fixed": bool(dp_model_info["module_fixed"]),
+            "stochastic_depth_disabled": int(dp_model_info["stochastic_depth_disabled"]),
+        }
+
     target_delta = resolve_dp_delta(dp_config, train_dataset_size)
     return {
         "enabled": True,
@@ -271,10 +297,7 @@ def make_dp_metadata(dp_config, train_dataset_size, dp_model_info):
 def prepare_private_training(config, model, optimizer, train_loader):
     dp_config = get_dp_config(config)
     if not dp_config["enabled"]:
-        raise ValueError(
-            "centralized/train_centralized_dp.py requires "
-            "differential_privacy.enabled: true."
-        )
+        return model, optimizer, train_loader, None
     if dp_config["mode"] != "noise_multiplier":
         raise ValueError(
             "centralized/train_centralized_dp.py currently supports only "
@@ -404,11 +427,6 @@ def train(config, records_by_split):
     from model import get_model
 
     dp_config = get_dp_config(config)
-    if not dp_config["enabled"]:
-        raise ValueError(
-            "centralized/train_centralized_dp.py is for DP training only. "
-            "Use centralized/train_centralized.py for non-DP runs."
-        )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     set_seed(config.get("seed", 0))
@@ -423,7 +441,7 @@ def train(config, records_by_split):
     class_weights = compute_class_weights(records_by_split["train"], device)
     criterion = build_criterion(config, class_weights, device)
     optimizer_metadata = configure_trainable_parameters(config, model)
-    optimizer = build_dp_sgd_optimizer(config, model)
+    optimizer = build_optimizer(config, model)
     model, optimizer, loaders["train"], privacy_engine = prepare_private_training(
         config,
         model,
@@ -449,6 +467,7 @@ def train(config, records_by_split):
     print(f"Training on {device}. Outputs will be saved to {workdir}")
     print(f"Split summary: {json.dumps(metrics_history['summary'], sort_keys=True)}")
     print("Data loaders: torch.utils.data.DataLoader for train/validation/test")
+    print(f"Differential privacy enabled: {dp_config['enabled']}")
     print(
         "Optimizer: "
         f"configured={optimizer_metadata['configured_name']} "
@@ -466,26 +485,28 @@ def train(config, records_by_split):
     for epoch in range(1, config["epochs"] + 1):
         epoch_start = time.perf_counter()
         train_metrics = train_one_epoch(model, loaders["train"], criterion, optimizer, device)
-        epsilon = get_epsilon(
-            privacy_engine,
-            metrics_history["differential_privacy"]["target_delta"],
-        )
         epoch_metrics = {
             "epoch": epoch,
             "train": train_metrics,
-            "differential_privacy": {
+        }
+        epsilon = None
+        if dp_config["enabled"]:
+            epsilon = get_epsilon(
+                privacy_engine,
+                metrics_history["differential_privacy"]["target_delta"],
+            )
+            epoch_metrics["differential_privacy"] = {
                 "epsilon": epsilon,
                 "delta": metrics_history["differential_privacy"]["target_delta"],
-            },
-        }
-        metrics_history["differential_privacy"]["per_epoch_epsilon"].append(
-            {"epoch": epoch, "epsilon": epsilon}
-        )
-        metrics_history["differential_privacy"]["final_epsilon"] = epsilon
-        if hasattr(optimizer, "noise_multiplier"):
-            metrics_history["differential_privacy"]["noise_multiplier"] = float(
-                optimizer.noise_multiplier
+            }
+            metrics_history["differential_privacy"]["per_epoch_epsilon"].append(
+                {"epoch": epoch, "epsilon": epsilon}
             )
+            metrics_history["differential_privacy"]["final_epsilon"] = epsilon
+            if hasattr(optimizer, "noise_multiplier"):
+                metrics_history["differential_privacy"]["noise_multiplier"] = float(
+                    optimizer.noise_multiplier
+                )
 
         if epoch % config.get("val_interval", 1) == 0:
             validation_metrics = evaluate(model, loaders["validation"], criterion, device)
@@ -500,14 +521,16 @@ def train(config, records_by_split):
         epoch_seconds = time.perf_counter() - epoch_start
         epoch_metrics["duration_seconds"] = epoch_seconds
         metrics_history["epochs"].append(epoch_metrics)
-        print(
+        progress = (
             f"Epoch {epoch:03d}/{config['epochs']:03d} "
             f"train_loss={train_metrics['loss']:.4f} "
             f"train_bal_acc={train_metrics['balanced_accuracy']:.4f} "
             f"val_bal_acc={epoch_metrics.get('validation', {}).get('balanced_accuracy', math.nan):.4f} "
-            f"epsilon={epsilon:.4f} "
-            f"epoch_time={format_duration(epoch_seconds)}"
         )
+        if epsilon is not None:
+            progress += f"epsilon={epsilon:.4f} "
+        progress += f"epoch_time={format_duration(epoch_seconds)}"
+        print(progress)
 
     torch.save(get_checkpoint_module(model).state_dict(), workdir / "last_model.pth")
     test_metrics = evaluate(model, loaders["test"], criterion, device)
