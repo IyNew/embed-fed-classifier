@@ -54,6 +54,11 @@ def parse_args():
     parser.add_argument("--workdir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--pretrained", choices=["true", "false"], default=None)
+    parser.add_argument(
+        "--grad-output",
+        action="store_true",
+        help="Enable per-batch gradient debug printing.",
+    )
     return parser.parse_args()
 
 
@@ -71,6 +76,8 @@ def apply_overrides(config, args):
         effective["seed"] = args.seed
     if args.pretrained is not None:
         effective.setdefault("model", {})["pretrained"] = args.pretrained == "true"
+    if args.grad_output:
+        effective.setdefault("debug", {})["grad_output"] = True
     return effective
 
 
@@ -275,7 +282,7 @@ def make_dp_metadata(dp_config, train_dataset_size, dp_model_info):
         }
 
     target_delta = resolve_dp_delta(dp_config, train_dataset_size)
-    return {
+    metadata = {
         "enabled": True,
         "accountant": dp_config["accountant"],
         "secure_mode": bool(dp_config.get("secure_mode", False)),
@@ -288,20 +295,25 @@ def make_dp_metadata(dp_config, train_dataset_size, dp_model_info):
         "module_fixed": bool(dp_model_info["module_fixed"]),
         "stochastic_depth_disabled": int(dp_model_info["stochastic_depth_disabled"]),
         "target_delta": target_delta,
-        "noise_multiplier": float(dp_config["noise_multiplier"]),
         "final_epsilon": None,
         "per_epoch_epsilon": [],
     }
+    if dp_config["mode"] == "noise_multiplier":
+        metadata["noise_multiplier"] = float(dp_config["noise_multiplier"])
+    elif dp_config["mode"] == "target_epsilon":
+        metadata["target_epsilon"] = float(dp_config["target_epsilon"])
+    return metadata
 
 
 def prepare_private_training(config, model, optimizer, train_loader):
     dp_config = get_dp_config(config)
     if not dp_config["enabled"]:
         return model, optimizer, train_loader, None
-    if dp_config["mode"] != "noise_multiplier":
+
+    if dp_config["mode"] not in {"noise_multiplier", "target_epsilon"}:
         raise ValueError(
-            "centralized/train_centralized_dp.py currently supports only "
-            "differential_privacy.mode: noise_multiplier."
+            "Unsupported differential_privacy.mode: "
+            f"{dp_config['mode']}. Expected 'noise_multiplier' or 'target_epsilon'."
         )
 
     privacy_engine_cls, _ = load_opacus()
@@ -309,16 +321,31 @@ def prepare_private_training(config, model, optimizer, train_loader):
         accountant=dp_config["accountant"],
         secure_mode=dp_config.get("secure_mode", False),
     )
-    model, optimizer, train_loader = privacy_engine.make_private(
-        module=model,
-        optimizer=optimizer,
-        data_loader=train_loader,
-        noise_multiplier=float(dp_config["noise_multiplier"]),
-        max_grad_norm=float(dp_config["max_grad_norm"]),
-        poisson_sampling=bool(dp_config.get("poisson_sampling", True)),
-        clipping=dp_config.get("clipping", "flat"),
-        grad_sample_mode=dp_config.get("grad_sample_mode", "hooks"),
-    )
+    common_kwargs = {
+        "module": model,
+        "optimizer": optimizer,
+        "data_loader": train_loader,
+        "max_grad_norm": float(dp_config["max_grad_norm"]),
+        "poisson_sampling": bool(dp_config.get("poisson_sampling", True)),
+        "clipping": dp_config.get("clipping", "flat"),
+        "grad_sample_mode": dp_config.get("grad_sample_mode", "hooks"),
+    }
+    if dp_config["mode"] == "noise_multiplier":
+        model, optimizer, train_loader = privacy_engine.make_private(
+            noise_multiplier=float(dp_config["noise_multiplier"]),
+            **common_kwargs,
+        )
+    else:
+        if dp_config.get("target_epsilon") is None:
+            raise ValueError(
+                "differential_privacy.target_epsilon is required when mode is 'target_epsilon'."
+            )
+        model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
+            epochs=int(config["epochs"]),
+            target_epsilon=float(dp_config["target_epsilon"]),
+            target_delta=resolve_dp_delta(dp_config, len(train_loader.dataset)),
+            **common_kwargs,
+        )
     return model, optimizer, train_loader, privacy_engine
 
 
@@ -331,7 +358,7 @@ def prepare_tuple_batch(batch, device):
     return inputs, labels
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, grad_output=False):
     import torch
 
     model.train()
@@ -348,6 +375,29 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         outputs = model(inputs)
         loss = criterion(outputs, labels)
         loss.backward()
+
+        # Gradient debug: pass --grad-output to enable this block.
+        if grad_output:
+            grad_sample_norms = []
+            for param in model.parameters():
+                grad_sample = getattr(param, "grad_sample", None)
+                if grad_sample is None:
+                    continue
+                grad_sample_norms.append(grad_sample.flatten(start_dim=1).norm(2, dim=1))
+            if grad_sample_norms:
+                per_sample_norms = torch.stack(grad_sample_norms, dim=1).norm(2, dim=1)
+                print(
+                    "DP per-sample grad norms: "
+                    f"mean={per_sample_norms.mean().item():.4f} "
+                    f"max={per_sample_norms.max().item():.4f} "
+                    f"p95={torch.quantile(per_sample_norms, 0.95).item():.4f}"
+                )
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float("inf"), error_if_nonfinite=False
+                )
+                print(f"Gradient norm: {grad_norm:.4f}")
+
         optimizer.step()
 
         running_loss += loss.item()
@@ -482,9 +532,17 @@ def train(config, records_by_split):
     )
 
     training_start = time.perf_counter()
+    grad_output = bool(config.get("debug", {}).get("grad_output", False))
     for epoch in range(1, config["epochs"] + 1):
         epoch_start = time.perf_counter()
-        train_metrics = train_one_epoch(model, loaders["train"], criterion, optimizer, device)
+        train_metrics = train_one_epoch(
+            model,
+            loaders["train"],
+            criterion,
+            optimizer,
+            device,
+            grad_output=grad_output,
+        )
         epoch_metrics = {
             "epoch": epoch,
             "train": train_metrics,

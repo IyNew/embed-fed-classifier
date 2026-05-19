@@ -52,6 +52,16 @@ Use Python 3 with 4-space indentation. Keep functions and variables in `snake_ca
 
 No automated test suite is currently present. For changes that do not require data, run `python -m py_compile federated/client.py federated/job.py centralized/train_centralized.py model.py utils.py`. For training or data-path changes, run a small simulation with reduced `num_rounds`, `local_epochs`, and `client_list`, or run centralized training with `--epochs 1 --num-workers 0 --batch-size 4`. New tests should live under `tests/` and use `test_*.py` naming.
 
+## Experiment Archive Protocol
+
+When archiving experiment results, use a date-name path under `centralized_runs/archive/YYYY-MM-DD/<descriptive_name>_<timestamp>/`. Move the completed run directories and the global sweep log into that folder. Include a `configs/` subdirectory containing exact YAML snapshots for every config used in the run, even if the active config files will also be moved elsewhere.
+
+Write an `insights.md` file in the archive root before closing the task. It should include the run timestamp, which configs completed or failed, the key validation/test metrics, privacy values when applicable, and a short interpretation of what the results imply for the next sweep.
+
+When the user asks to archive results, update `centralized_runs/results_summary.csv` for every successfully finished run being archived. Include the archive path, run name, status, key training settings, DP settings, validation/test metrics, privacy values, and leave the `Note` field available for manual annotations.
+
+After archiving, clean the active workspace: remove or move the run artifacts from the top level of `centralized_runs`, and move completed active YAMLs from `centralized/experiment_configs/` into `centralized/experiment_configs/archive/` unless the user asks to keep them active. Verify no training or watchdog processes still point at moved logs before or after moving files.
+
 ## Commit & Pull Request Guidelines
 
 The Git history uses short summaries such as `env file` and `initial commit`. Keep commits concise and focused, for example `add convnext dropout config` or `fix client evaluation metrics`.
