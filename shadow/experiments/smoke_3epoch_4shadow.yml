@@ -1,0 +1,138 @@
+# Data configuration
+data_csv: "/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/first_model_trainig.csv"
+cleaned_data_root: "/mnt/c/Data/EMBED/embed_cleaned"
+workdir: "./shadow_runs/smoke_3epoch_4shadow"
+
+input:
+  mode: "shadow_attack"
+  attack_manifest: "./shadow_runs/smoke_3epoch_4shadow/split/attack_manifest.csv"
+  split_plan: "./shadow_runs/smoke_3epoch_4shadow/split/split_plan.json"
+  regenerate: false
+  validate_paths: true
+
+shadow_attack:
+  pool_counts:
+    D_mem: 3364
+    D_non: 1122
+    D_aux: 1122
+  target_counts:
+    member: 10
+    nonmember: 10
+  shadow_pool_size: 800
+  shadow_subset_count: 32
+  shadow_subset_size: 500
+  in_subset_count: 16
+  nonmember_validation_fraction: 0.3333333333
+
+shadow_training:
+  gpu_nodes: 1
+  run_target: true
+  run_shadows: true
+  skip_completed: true
+  completed_files: ["metrics.json", "best_model.pth", "last_model.pth"]
+  max_targets: 1
+  max_in: 2
+  max_out: 2
+  stop_on_failure: true
+
+splits:
+  train: "train"
+  validation: "validation"
+  test: "test"
+
+seed: 0
+dataset: "PersistentDataset"
+cache_dir: "./shadow_runs/cache/convnext_256_ras_scale_v1"
+cache_rate: 1
+
+dataloader:
+  batch_size: 128
+  num_workers: 10
+  shuffle: true
+  pin_memory: true
+
+epochs: 3
+val_interval: 1
+save_metric: "balanced_accuracy"
+
+differential_privacy:
+  enabled: false
+  accountant: "prv"
+  secure_mode: false
+  mode: "noise_multiplier"
+  noise_multiplier: 1.0
+  target_epsilon: null
+  target_delta: null
+  max_grad_norm: 1.0
+  poisson_sampling: true
+  clipping: "flat"
+  grad_sample_mode: "hooks"
+  fix_modules: true
+
+optimizer:
+  name: "Adam"
+  freeze_backbone: false
+  lr_backbone: 0.00001
+  lr_finetune: 0.0001
+  betas: [0.9, 0.999]
+  epsilon: 0.00000008
+  weight_decay: 0.00005
+
+loss:
+  name: "CrossEntropyLoss"
+  label_smoothing: 0.1
+  class_weights: true
+
+model:
+  name: "ConvNeXtTiny"
+  num_classes: 2
+  pretrained: true
+  dropout: 0.5
+
+train_transforms:
+  LoadImaged_im:
+    keys: ["image"]
+    ensure_channel_first: true
+  ScaleIntensityd:
+    keys: ["image"]
+  Orientationd:
+    keys: ["image"]
+    axcodes: "RAS"
+    as_closest_canonical: true
+  ResizeWithPadOrCropd:
+    keys: ["image"]
+    spatial_size: [256, 256]
+  RandFlipd_x:
+    keys: ["image"]
+    prob: 0.2
+    spatial_axis: 0
+  RandFlipd_y:
+    keys: ["image"]
+    prob: 0.2
+    spatial_axis: 1
+  RandRotated:
+    keys: ["image"]
+    prob: 0.2
+    range_x: [-0.8, 0.8]
+    range_y: [-0.8, 0.8]
+    mode: "bilinear"
+  RandAffined:
+    keys: ["image"]
+    prob: 0.2
+    rotate_range: [0.2]
+    scale_range: [0.2]
+    mode: "bilinear"
+
+eval_transforms:
+  LoadImaged_im:
+    keys: ["image"]
+    ensure_channel_first: true
+  ScaleIntensityd:
+    keys: ["image"]
+  Orientationd:
+    keys: ["image"]
+    axcodes: "RAS"
+    as_closest_canonical: true
+  ResizeWithPadOrCropd:
+    keys: ["image"]
+    spatial_size: [256, 256]

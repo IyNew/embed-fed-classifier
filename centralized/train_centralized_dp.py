@@ -14,27 +14,48 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from train_centralized import (  # noqa: E402
-    build_criterion,
-    build_datasets,
-    calculate_metrics,
-    compute_class_weights,
-    disable_stochastic_depth,
-    format_duration,
-    get_checkpoint_module,
-    get_dp_config,
-    get_epsilon,
-    load_config,
-    load_manifest,
-    load_opacus,
-    resolve_dp_delta,
-    save_config,
-    set_seed,
-    summarize_records,
-    classify_parameters,
-    count_parameters,
-    split_parameters,
-)
+try:
+    from centralized.train_centralized import (  # noqa: E402
+        build_criterion,
+        build_datasets,
+        calculate_metrics,
+        compute_class_weights,
+        disable_stochastic_depth,
+        format_duration,
+        get_checkpoint_module,
+        get_dp_config,
+        get_epsilon,
+        load_config,
+        load_opacus,
+        resolve_dp_delta,
+        save_config,
+        set_seed,
+        classify_parameters,
+        count_parameters,
+        split_parameters,
+    )
+    from centralized.input_data import load_records, summarize_records  # noqa: E402
+except ModuleNotFoundError:
+    from train_centralized import (  # noqa: E402
+        build_criterion,
+        build_datasets,
+        calculate_metrics,
+        compute_class_weights,
+        disable_stochastic_depth,
+        format_duration,
+        get_checkpoint_module,
+        get_dp_config,
+        get_epsilon,
+        load_config,
+        load_opacus,
+        resolve_dp_delta,
+        save_config,
+        set_seed,
+        classify_parameters,
+        count_parameters,
+        split_parameters,
+    )
+    from input_data import load_records, summarize_records  # noqa: E402
 
 
 def parse_args():
@@ -627,7 +648,7 @@ def train(config, records_by_split):
 def main():
     args = parse_args()
     config = apply_overrides(load_config(args.config), args)
-    records_by_split = load_manifest(config)
+    records_by_split = load_records(config)
     summary = summarize_records(records_by_split)
 
     if args.check_data_only:

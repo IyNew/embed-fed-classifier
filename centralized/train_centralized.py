@@ -266,15 +266,27 @@ def build_transforms(config, train):
 
 
 def build_datasets(config, records_by_split):
-    from monai.data import CacheDataset, Dataset
+    from monai.data import CacheDataset, Dataset, PersistentDataset
 
-    dataset_cls = CacheDataset if config.get("dataset") == "CacheDataset" else Dataset
+    dataset_name = config.get("dataset", "Dataset")
+    dataset_classes = {
+        "Dataset": Dataset,
+        "CacheDataset": CacheDataset,
+        "PersistentDataset": PersistentDataset,
+    }
+    if dataset_name not in dataset_classes:
+        raise ValueError(f"Unsupported dataset type: {dataset_name}")
+    dataset_cls = dataset_classes[dataset_name]
     train_transforms = build_transforms(config, train=True)
     eval_transforms = build_transforms(config, train=False)
 
     kwargs = {}
     if dataset_cls is CacheDataset:
         kwargs["cache_rate"] = config.get("cache_rate", 1)
+    elif dataset_cls is PersistentDataset:
+        cache_dir = Path(config.get("cache_dir") or Path(config["workdir"]) / "persistent_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        kwargs["cache_dir"] = str(cache_dir)
 
     return {
         "train": dataset_cls(data=records_by_split["train"], transform=train_transforms, **kwargs),

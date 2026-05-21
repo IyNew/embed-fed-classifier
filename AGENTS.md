@@ -54,6 +54,8 @@ No automated test suite is currently present. For changes that do not require da
 
 ## Experiment Archive Protocol
 
+When starting any experiment run or sweep, keep a global log following the centralized training process pattern. Create the log before launching jobs, append the experiment name, timestamp, config path(s), command, output/work directories, and each run's start/completion/failure status as it happens. Keep this log outside the individual model workdirs so it can be archived with the completed results.
+
 When archiving experiment results, use a date-name path under `centralized_runs/archive/YYYY-MM-DD/<descriptive_name>_<timestamp>/`. Move the completed run directories and the global sweep log into that folder. Include a `configs/` subdirectory containing exact YAML snapshots for every config used in the run, even if the active config files will also be moved elsewhere.
 
 Write an `insights.md` file in the archive root before closing the task. It should include the run timestamp, which configs completed or failed, the key validation/test metrics, privacy values when applicable, and a short interpretation of what the results imply for the next sweep.

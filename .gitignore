@@ -39,6 +39,8 @@ logs/
 runs/
 centralized_runs/
 federated_runs/
+shadow/train/artifacts/
+shadow_runs/
 workdir/
 workspace/
 
