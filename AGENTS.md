@@ -60,7 +60,7 @@ When archiving experiment results, use a date-name path under `centralized_runs/
 
 Write an `insights.md` file in the archive root before closing the task. It should include the run timestamp, which configs completed or failed, the key validation/test metrics, privacy values when applicable, and a short interpretation of what the results imply for the next sweep.
 
-When the user asks to archive results, update `centralized_runs/results_summary.csv` for every successfully finished run being archived. Include the archive path, run name, status, key training settings, DP settings, validation/test metrics, privacy values, and leave the `Note` field available for manual annotations.
+When the user asks to archive results, update `centralized/results_summary.csv` for every successfully finished run being archived. Include the archive path, run name, status, key training settings, DP settings, validation/test metrics, privacy values, and leave the `Note` field available for manual annotations.
 
 After archiving, clean the active workspace: remove or move the run artifacts from the top level of `centralized_runs`, and move completed active YAMLs from `centralized/experiment_configs/` into `centralized/experiment_configs/archive/` unless the user asks to keep them active. Verify no training or watchdog processes still point at moved logs before or after moving files.
 
