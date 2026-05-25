@@ -64,6 +64,14 @@ When the user asks to archive results, update `centralized/results_summary.csv` 
 
 After archiving, clean the active workspace: remove or move the run artifacts from the top level of `centralized_runs`, and move completed active YAMLs from `centralized/experiment_configs/` into `centralized/experiment_configs/archive/` unless the user asks to keep them active. Verify no training or watchdog processes still point at moved logs before or after moving files.
 
+## HPC Slurm Protocol
+
+When the user asks for an sbatch script for the HPC environment, use `scripts/sbatch_example.sbatch` as the template. Create the customized copy under the project root unless the user asks for a different location, and update its job name, config list, log paths, and training command for the requested run.
+
+Use `centralized/centralized_hpc_smoke_config.yml` as the source of HPC data path information. HPC configs should use `data_csv: "/N/u/wenytang/Quartz/embed_data/cleaned_data_points.csv"`, `cleaned_data_root: "/N/slate/wenytang/embed_cleaned"`, `dataset: "PersistentDataset"`, and `cache_dir: ./centralized_runs/cache/convnext_256_ras_scale_v1`.
+
+For centralized DP training on HPC, prefer `python centralized/train_centralized_dp.py -c <config>`.
+
 ## Commit & Pull Request Guidelines
 
 The Git history uses short summaries such as `env file` and `initial commit`. Keep commits concise and focused, for example `add convnext dropout config` or `fix client evaluation metrics`.
