@@ -104,7 +104,8 @@ def apply_overrides(config, args):
 
 def make_model_dp_compatible(config, model):
     dp_config = get_dp_config(config)
-    if not dp_config["enabled"]:
+    grad_output = bool(config.get("debug", {}).get("grad_output", False))
+    if not dp_config["enabled"] and not grad_output:
         return model, {"module_fixed": False, "stochastic_depth_disabled": 0}
 
     _, module_validator = load_opacus()
@@ -329,6 +330,20 @@ def make_dp_metadata(dp_config, train_dataset_size, dp_model_info):
 def prepare_private_training(config, model, optimizer, train_loader):
     dp_config = get_dp_config(config)
     if not dp_config["enabled"]:
+        if bool(config.get("debug", {}).get("grad_output", False)):
+            try:
+                from opacus.grad_sample import GradSampleModule
+            except ImportError as exc:
+                raise ImportError(
+                    "debug.grad_output=true requires Opacus to collect per-sample "
+                    "gradient norms. Install Opacus or disable grad_output."
+                ) from exc
+            model = GradSampleModule(
+                model,
+                batch_first=True,
+                loss_reduction="mean",
+                strict=True,
+            )
         return model, optimizer, train_loader, None
 
     if dp_config["mode"] not in {"noise_multiplier", "target_epsilon"}:
