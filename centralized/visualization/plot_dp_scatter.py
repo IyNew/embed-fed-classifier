@@ -49,9 +49,16 @@ def build_noise_lookup():
 noise_lookup = build_noise_lookup()
 print(f"Noise multiplier lookup: {len(noise_lookup)} entries")
 
-baseline = fb[(fb["DPEnabled"] == False) & (fb["BestValAUC"] > 0.5)]
+baseline = fb[
+    (fb["DPEnabled"] == False)
+    & (fb["BestValAUC"] > 0.5)
+    & (fb["Optimizer"] != "SGD")
+    & (~fb["ArchivePath"].str.contains("shadow", na=False))
+].copy()
 baseline_auc = baseline["BestValAUC"].max()
+baseline_auc_min = baseline["BestValAUC"].min()
 baseline_run = baseline.loc[baseline["BestValAUC"].idxmax()]
+print(f"Non-DP baseline: {len(baseline)} runs, range=[{baseline_auc_min:.4f}, {baseline_auc:.4f}]")
 
 target_eps = fb[
     (fb["DPMode"] == "target_epsilon")
@@ -78,43 +85,51 @@ print(f"Noise multiplier: {len(noise_mode)} runs")
 
 fig = go.Figure()
 
+# --- Non-DP baseline range lines ---
 fig.add_hline(
     y=baseline_auc,
     line_dash="dash",
     line_color="green",
-    annotation_text=f"Non-DP baseline (AUC={baseline_auc:.4f})",
+    annotation_text=f"Non-DP max (AUC={baseline_auc:.4f})",
+    annotation_position="right",
+)
+fig.add_hline(
+    y=baseline_auc_min,
+    line_dash="dot",
+    line_color="green",
+    annotation_text=f"Non-DP min (AUC={baseline_auc_min:.4f})",
     annotation_position="right",
 )
 
-non_dp_hover = (
-    f"<b>{baseline_run['RunName']}</b><br>"
-    f"Mode: non-DP (no privacy)<br>"
-    f"Epochs: {baseline_run['Epochs']}<br>"
-    f"Optimizer: {baseline_run['Optimizer']}<br>"
-    f"LrBackbone: {baseline_run['LrBackbone']}<br>"
-    f"LrFinetune: {baseline_run['LrFinetune']}<br>"
-    f"BatchSize: {baseline_run['BatchSize']}<br>"
-    f"Best Val AUC: {baseline_run['BestValAUC']:.4f}<br>"
-    f"Best Val BalAcc: {baseline_run['BestValBalancedAccuracy']:.4f}<br>"
-    f"Best Val Sens: {baseline_run['BestValSensitivity']:.4f}<br>"
-    f"Best Val Spec: {baseline_run['BestValSpecificity']:.4f}<br>"
-    f"Final Test AUC: {baseline_run['FinalTestAUC']:.4f}<br>"
-    f"Final Test BalAcc: {baseline_run['FinalTestBalancedAccuracy']:.4f}<br>"
-    f"Final Test Sens: {baseline_run['FinalTestSensitivity']:.4f}<br>"
-    f"Final Test Spec: {baseline_run['FinalTestSpecificity']:.4f}"
-)
+# --- Non-DP baseline scatter points ---
+non_dp_hover_texts = []
+for _, row in baseline.iterrows():
+    non_dp_hover_texts.append(
+        f"<b>{row['RunName']}</b><br>"
+        f"Mode: non-DP (no privacy)<br>"
+        f"Epochs: {row['Epochs']}<br>"
+        f"Optimizer: {row['Optimizer']}<br>"
+        f"LrBackbone: {row['LrBackbone']}<br>"
+        f"LrFinetune: {row['LrFinetune']}<br>"
+        f"BatchSize: {row['BatchSize']}<br>"
+        f"Best Val AUC: {row['BestValAUC']:.4f}<br>"
+        f"Best Val BalAcc: {row['BestValBalancedAccuracy']:.4f}<br>"
+        f"Best Val Sens: {row['BestValSensitivity']:.4f}<br>"
+        f"Best Val Spec: {row['BestValSpecificity']:.4f}<br>"
+        f"Final Test AUC: {row['FinalTestAUC']:.4f}<br>"
+        f"Final Test BalAcc: {row['FinalTestBalancedAccuracy']:.4f}<br>"
+        f"Final Test Sens: {row['FinalTestSensitivity']:.4f}<br>"
+        f"Final Test Spec: {row['FinalTestSpecificity']:.4f}"
+    )
 
 fig.add_trace(go.Scatter(
-    x=[29.5],
-    y=[baseline_auc],
-    mode="markers+text",
-    name="Non-DP baseline",
-    marker=dict(size=16, color="green", symbol="star", line=dict(width=1.5, color="black")),
-    text=["★ baseline"],
-    textposition="top center",
-    textfont=dict(size=9, color="green"),
+    x=[30] * len(baseline),
+    y=baseline["BestValAUC"],
+    mode="markers",
+    name=f"Non-DP (n={len(baseline)})",
+    marker=dict(size=10, color="green", symbol="diamond", line=dict(width=1, color="black")),
     hovertemplate="%{hovertext}<extra></extra>",
-    hovertext=[non_dp_hover],
+    hovertext=non_dp_hover_texts,
 ))
 
 

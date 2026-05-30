@@ -427,6 +427,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_output=Fal
                     f"mean={per_sample_norms.mean().item():.4f} "
                     f"max={per_sample_norms.max().item():.4f} "
                     f"p95={torch.quantile(per_sample_norms, 0.95).item():.4f}"
+                    f"p99={torch.quantile(per_sample_norms, 0.99).item():.4f}"
                 )
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
