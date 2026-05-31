@@ -54,6 +54,8 @@ No automated test suite is currently present. For changes that do not require da
 
 ## Experiment Archive Protocol
 
+Use `centralized/experiment_to_do.md` to track finished and planned centralized experiments. Keep entries short; when an experiment is finished, mark it checked and map it to the archive path.
+
 When starting any experiment run or sweep, keep a global log following the centralized training process pattern. Create the log before launching jobs, append the experiment name, timestamp, config path(s), command, output/work directories, and each run's start/completion/failure status as it happens. Keep this log outside the individual model workdirs so it can be archived with the completed results.
 
 When archiving experiment results, always place everything under a date-based archive path: `centralized_runs/archive/YYYY-MM-DD/<descriptive_name>_<timestamp>/`. No unarchived artifact may sit directly under `centralized_runs/archive/` or `centralized_runs/` without a date subdirectory. Move the completed run directories and the global sweep log into that folder. Include a `configs/` subdirectory containing exact YAML snapshots for every config used in the run, even if the active config files will also be moved elsewhere.
