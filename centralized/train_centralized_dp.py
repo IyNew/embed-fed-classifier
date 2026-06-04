@@ -402,6 +402,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_output=Fal
     labels_total = []
     predictions_total = []
     probabilities_total = []
+    grad_output_warning_printed = False
 
     for batch in loader:
         inputs, labels = prepare_tuple_batch(batch, device)
@@ -419,16 +420,31 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_output=Fal
                 grad_sample = getattr(param, "grad_sample", None)
                 if grad_sample is None:
                     continue
-                grad_sample_norms.append(grad_sample.flatten(start_dim=1).norm(2, dim=1))
+                try:
+                    grad_sample_norms.append(
+                        grad_sample.flatten(start_dim=1).norm(2, dim=1)
+                    )
+                except (AttributeError, RuntimeError, TypeError) as exc:
+                    if not grad_output_warning_printed:
+                        print(
+                            "Skipping incompatible grad_sample in debug output: "
+                            f"{type(grad_sample).__name__} ({exc})"
+                        )
+                        grad_output_warning_printed = True
             if grad_sample_norms:
-                per_sample_norms = torch.stack(grad_sample_norms, dim=1).norm(2, dim=1)
-                print(
-                    "DP per-sample grad norms: "
-                    f"mean={per_sample_norms.mean().item():.4f} "
-                    f"max={per_sample_norms.max().item():.4f} "
-                    f"p95={torch.quantile(per_sample_norms, 0.95).item():.4f} "
-                    f"p99={torch.quantile(per_sample_norms, 0.99).item():.4f}"
-                )
+                try:
+                    per_sample_norms = torch.stack(grad_sample_norms, dim=1).norm(2, dim=1)
+                    print(
+                        "DP per-sample grad norms: "
+                        f"mean={per_sample_norms.mean().item():.4f} "
+                        f"max={per_sample_norms.max().item():.4f} "
+                        f"p95={torch.quantile(per_sample_norms, 0.95).item():.4f} "
+                        f"p99={torch.quantile(per_sample_norms, 0.99).item():.4f}"
+                    )
+                except RuntimeError as exc:
+                    if not grad_output_warning_printed:
+                        print(f"Skipping DP per-sample grad norm debug output: {exc}")
+                        grad_output_warning_printed = True
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), float("inf"), error_if_nonfinite=False
