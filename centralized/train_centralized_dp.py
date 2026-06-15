@@ -102,6 +102,18 @@ def apply_overrides(config, args):
     return effective
 
 
+def get_checkpoint_config(config):
+    checkpoint_config = config.get("checkpoint", {})
+    save_best = bool(checkpoint_config.get("save_best", True))
+    save_last = bool(checkpoint_config.get("save_last", True))
+    if not save_best and not save_last:
+        raise ValueError("checkpoint must save at least one of save_best or save_last.")
+    return {
+        "save_best": save_best,
+        "save_last": save_last,
+    }
+
+
 def make_model_dp_compatible(config, model):
     dp_config = get_dp_config(config)
     grad_output = bool(config.get("debug", {}).get("grad_output", False))
@@ -530,6 +542,7 @@ def train(config, records_by_split):
     from model import get_model
 
     dp_config = get_dp_config(config)
+    checkpoint_config = get_checkpoint_config(config)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     set_seed(config.get("seed", 0))
@@ -564,6 +577,7 @@ def train(config, records_by_split):
             len(datasets["train"]),
             dp_model_info,
         ),
+        "checkpoint": checkpoint_config,
         "epochs": [],
     }
 
@@ -625,9 +639,13 @@ def train(config, records_by_split):
             metric_value = validation_metrics[best_metric_name]
             if not math.isnan(metric_value) and metric_value > best_metric:
                 best_metric = metric_value
-                torch.save(get_checkpoint_module(model).state_dict(), workdir / "best_model.pth")
                 metrics_history["best_epoch"] = epoch
                 metrics_history["best_validation"] = validation_metrics
+                if checkpoint_config["save_best"]:
+                    torch.save(
+                        get_checkpoint_module(model).state_dict(),
+                        workdir / "best_model.pth",
+                    )
 
         epoch_seconds = time.perf_counter() - epoch_start
         epoch_metrics["duration_seconds"] = epoch_seconds
@@ -643,11 +661,12 @@ def train(config, records_by_split):
         progress += f"epoch_time={format_duration(epoch_seconds)}"
         print(progress)
 
-    torch.save(get_checkpoint_module(model).state_dict(), workdir / "last_model.pth")
+    if checkpoint_config["save_last"]:
+        torch.save(get_checkpoint_module(model).state_dict(), workdir / "last_model.pth")
     test_metrics = evaluate(model, loaders["test"], criterion, device)
     metrics_history["test"] = test_metrics
     best_model_path = workdir / "best_model.pth"
-    if best_model_path.exists():
+    if checkpoint_config["save_best"] and best_model_path.exists():
         get_checkpoint_module(model).load_state_dict(
             torch.load(best_model_path, map_location=device)
         )
