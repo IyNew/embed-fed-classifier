@@ -16,8 +16,8 @@ shadow_attack:
     D_non: 1122
     D_aux: 1122
   target_counts:
-    member: 10
-    nonmember: 10
+    member: 30
+    nonmember: 30
   shadow_pool_size: 800
   shadow_subset_count: 32
   shadow_subset_size: 500
@@ -29,7 +29,7 @@ shadow_training:
   run_target: true
   run_shadows: true
   skip_completed: true
-  completed_files: ["metrics.json", "best_model.pth", "last_model.pth"]
+  completed_files: ["metrics.json", "last_model.pth"]
   max_targets: null
   max_in: null
   max_out: null
@@ -54,6 +54,10 @@ dataloader:
 epochs: 30
 val_interval: 1
 save_metric: "balanced_accuracy"
+
+checkpoint:
+  save_best: false
+  save_last: true
 
 differential_privacy:
   enabled: false
