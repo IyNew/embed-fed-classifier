@@ -34,7 +34,11 @@ try:
         count_parameters,
         split_parameters,
     )
-    from centralized.input_data import load_records, summarize_records  # noqa: E402
+    from centralized.input_data import (  # noqa: E402
+        ensure_conditional_dp_split,
+        load_records,
+        summarize_records,
+    )
 except ModuleNotFoundError:
     from train_centralized import (  # noqa: E402
         build_criterion,
@@ -55,7 +59,7 @@ except ModuleNotFoundError:
         count_parameters,
         split_parameters,
     )
-    from input_data import load_records, summarize_records  # noqa: E402
+    from input_data import ensure_conditional_dp_split, load_records, summarize_records  # noqa: E402
 
 
 def parse_args():
@@ -69,6 +73,7 @@ def parse_args():
         default=str(Path(__file__).with_name("centralized_config.yml")),
     )
     parser.add_argument("--check-data-only", action="store_true")
+    parser.add_argument("--generate-split-only", action="store_true")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -699,6 +704,22 @@ def train(config, records_by_split):
 def main():
     args = parse_args()
     config = apply_overrides(load_config(args.config), args)
+
+    if args.generate_split_only:
+        rows, split_plan = ensure_conditional_dp_split(config)
+        summary = {
+            "row_counts": split_plan.get("row_counts", {}),
+            "patient_counts": split_plan.get("patient_counts", {}),
+            "available_train_rows": split_plan.get("available_train_rows", {}),
+            "run_selections": summarize_conditional_run_selections(
+                split_plan.get("run_selections", {})
+            ),
+            "derived_manifest_rows": len(rows),
+        }
+        print("Conditional DP split generation passed.")
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
+
     records_by_split = load_records(config)
     summary = summarize_records(records_by_split)
 
@@ -708,6 +729,34 @@ def main():
         return
 
     train(config, records_by_split)
+
+
+def summarize_conditional_run_selections(run_selections):
+    summary = {}
+    for key, selection in run_selections.items():
+        summary[key] = {
+            field: selection.get(field)
+            for field in (
+                "status",
+                "reason",
+                "count_unit",
+                "selection_policy",
+                "N_plus",
+                "requested_N_plus",
+                "actual_N_plus",
+                "rho",
+                "requested_N_minus",
+                "resolved_N_minus",
+                "N_minus",
+                "actual_N_minus",
+                "capped_N_minus",
+                "available_train_rows",
+                "selected_patient_counts",
+                "selected_row_counts",
+            )
+            if field in selection
+        }
+    return summary
 
 
 if __name__ == "__main__":

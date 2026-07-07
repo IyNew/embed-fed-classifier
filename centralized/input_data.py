@@ -11,6 +11,11 @@ except ModuleNotFoundError:
 
 
 REQUIRED_MANIFEST_COLUMNS = {"binary_label"}
+CONDITIONAL_DP_DEFAULT_DIR = Path(__file__).resolve().parents[1] / "conditional_dp" / "data"
+CONDITIONAL_SAMPLE_ID_COLUMN = "conditional_sample_id"
+CONDITIONAL_PATIENT_ID_COLUMN = "conditional_patient_id"
+CONDITIONAL_PATIENT_LABEL_COLUMN = "conditional_patient_label"
+SOURCE_SPLIT_COLUMN = "source_model_split"
 ATTACK_POOL_COLUMN = "attack_pool"
 ATTACK_TARGET_ROLE_COLUMN = "attack_target_role"
 ATTACK_TARGET_ID_COLUMN = "attack_target_id"
@@ -42,6 +47,8 @@ def load_records(config):
         return load_manifest(config)
     if mode == "shadow_attack":
         return load_shadow_attack_records(config)
+    if mode == "conditional_dp":
+        return load_conditional_dp_records(config)
     raise ValueError(f"Unsupported input.mode: {mode}")
 
 
@@ -71,6 +78,63 @@ def load_shadow_attack_records(config, train_spec=None):
     }
     validate_nonempty_splits(records_by_split)
     return records_by_split
+
+
+def load_conditional_dp_records(config):
+    rows, split_plan = ensure_conditional_dp_split(config)
+    train_rows, validation_rows, test_rows = select_conditional_dp_rows(
+        rows,
+        split_plan,
+        config,
+    )
+    records_by_split = {
+        "train": rows_to_records(train_rows, config),
+        "validation": rows_to_records(validation_rows, config),
+        "test": rows_to_records(test_rows, config),
+    }
+    validate_nonempty_splits(records_by_split)
+    return records_by_split
+
+
+def ensure_conditional_dp_split(config):
+    input_config = config.get("input", {})
+    manifest_path = resolve_conditional_output_path(
+        input_config.get("conditional_manifest")
+        or input_config.get("derived_manifest"),
+        "derived_manifest.csv",
+    )
+    split_plan_path = resolve_conditional_output_path(
+        input_config.get("split_plan"),
+        "split_plan.json",
+    )
+    regenerate = bool(input_config.get("regenerate", False))
+
+    if not regenerate and manifest_path.exists() and split_plan_path.exists():
+        rows = read_csv_rows(manifest_path)
+        split_plan = read_json(split_plan_path)
+        if conditional_split_plan_matches_config(split_plan, config):
+            if ensure_conditional_run_metadata(rows, split_plan, config):
+                write_json(split_plan_path, split_plan)
+            return rows, split_plan
+
+    rows = read_source_manifest(config)
+    row_ids = unique_row_ids(rows)
+    patient_groups = build_patient_groups(rows, row_ids, config)
+    split_plan = build_conditional_dp_split_plan(patient_groups, config)
+    apply_conditional_dp_plan(rows, row_ids, patient_groups, split_plan)
+    validate_conditional_dp_plan(rows, split_plan, config)
+    write_conditional_manifest_rows(manifest_path, rows)
+    write_json(split_plan_path, split_plan)
+    return rows, split_plan
+
+
+def resolve_conditional_output_path(value, default_name):
+    if value:
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
+    return CONDITIONAL_DP_DEFAULT_DIR / default_name
 
 
 def ensure_shadow_attack_split(config):
@@ -121,6 +185,785 @@ def read_source_manifest(config):
     if invalid_labels:
         raise ValueError(f"Unexpected binary_label values: {sorted(invalid_labels)}")
     return rows
+
+
+def unique_row_ids(rows):
+    row_ids = []
+    seen = {}
+    duplicates = []
+    for index, row in enumerate(rows):
+        sample_id = row_id(row, index)
+        if sample_id in seen:
+            duplicates.append(
+                {
+                    "sample_id": sample_id,
+                    "first_row": seen[sample_id] + 2,
+                    "duplicate_row": index + 2,
+                }
+            )
+        seen[sample_id] = index
+        row_ids.append(sample_id)
+    if duplicates:
+        raise ValueError(
+            "Conditional DP requires unique sample identifiers. "
+            f"First duplicates: {duplicates[:10]}"
+        )
+    return row_ids
+
+
+def conditional_patient_id_column(config):
+    return str(
+        config.get("conditional_dp", {}).get("patient_id_column", "empi_anon")
+    ).strip()
+
+
+def build_patient_groups(rows, row_ids, config):
+    patient_id_column = conditional_patient_id_column(config)
+    if not patient_id_column:
+        raise ValueError("conditional_dp.patient_id_column must be a nonempty string.")
+    if patient_id_column not in rows[0]:
+        raise ValueError(
+            "Conditional DP patient-level splitting requires "
+            f"patient_id_column={patient_id_column!r}, but it is missing from the manifest."
+        )
+
+    groups = {}
+    missing_rows = []
+    for index, (row, sample_id) in enumerate(zip(rows, row_ids)):
+        patient_id = str(row.get(patient_id_column, "")).strip()
+        if not patient_id:
+            missing_rows.append(index + 2)
+            continue
+        group = groups.setdefault(
+            patient_id,
+            {
+                "patient_id": patient_id,
+                "first_index": index,
+                "sample_ids": [],
+                "row_indices": [],
+                "row_label_counts": Counter(),
+            },
+        )
+        group["sample_ids"].append(sample_id)
+        group["row_indices"].append(index)
+        group["row_label_counts"][normalized_label(row)] += 1
+
+    if missing_rows:
+        raise ValueError(
+            f"Rows missing conditional DP patient IDs in {patient_id_column!r}: "
+            f"{missing_rows[:10]}"
+        )
+    if not groups:
+        raise ValueError("Conditional DP split found no patient groups.")
+
+    for group in groups.values():
+        group["patient_label"] = patient_label_from_counts(group["row_label_counts"])
+        group["row_count"] = len(group["row_indices"])
+        group["label_counts"] = dict(group["row_label_counts"])
+        del group["row_label_counts"]
+    return groups
+
+
+def patient_label_from_counts(label_counts):
+    return "malignant" if label_counts.get("malignant", 0) else "benign"
+
+
+def parse_split_fractions(config):
+    configured = config.get("conditional_dp", {}).get("split_fractions", {})
+    fractions = {"train": 0.70, "validation": 0.10, "test": 0.20}
+    fractions.update(configured)
+    required = {"train", "validation", "test"}
+    missing = required - set(fractions)
+    if missing:
+        raise ValueError(f"conditional_dp.split_fractions missing keys: {sorted(missing)}")
+
+    parsed = {key: float(fractions[key]) for key in ("train", "validation", "test")}
+    invalid = {key: value for key, value in parsed.items() if value < 0}
+    if invalid:
+        raise ValueError(f"conditional_dp.split_fractions must be nonnegative: {invalid}")
+    total = sum(parsed.values())
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(
+            "conditional_dp.split_fractions must sum to 1.0; "
+            f"got {total:.8f}"
+        )
+    if parsed["train"] <= 0:
+        raise ValueError("conditional_dp.split_fractions.train must be > 0.")
+    return parsed
+
+
+def fractional_split_counts(total, fractions):
+    split_names = ("train", "validation", "test")
+    raw = {name: total * fractions[name] for name in split_names}
+    counts = {name: int(raw[name]) for name in split_names}
+    remaining = total - sum(counts.values())
+    remainders = sorted(
+        split_names,
+        key=lambda name: (raw[name] - counts[name], fractions[name]),
+        reverse=True,
+    )
+    for name in remainders[:remaining]:
+        counts[name] += 1
+
+    positive_splits = [name for name in split_names if fractions[name] > 0]
+    if total >= len(positive_splits):
+        for name in positive_splits:
+            if counts[name] != 0:
+                continue
+            donors = [split for split in split_names if counts[split] > 1]
+            if not donors:
+                break
+            donor = max(donors, key=lambda split: (counts[split], fractions[split]))
+            counts[donor] -= 1
+            counts[name] += 1
+    return counts
+
+
+def build_conditional_dp_split_plan(patient_groups, config):
+    fractions = parse_split_fractions(config)
+    seed = int(config.get("conditional_dp", {}).get("split_seed", config.get("seed", 0)))
+    rng = random.Random(seed)
+
+    patient_ids_by_label = {"benign": [], "malignant": []}
+    for patient_id, group in sorted(
+        patient_groups.items(),
+        key=lambda item: item[1]["first_index"],
+    ):
+        patient_ids_by_label[group["patient_label"]].append(patient_id)
+
+    patients_by_split_label = {
+        split: {"benign": [], "malignant": []}
+        for split in ("train", "validation", "test")
+    }
+    for label, patient_ids in patient_ids_by_label.items():
+        shuffled = list(patient_ids)
+        rng.shuffle(shuffled)
+        counts = fractional_split_counts(len(shuffled), fractions)
+        offset = 0
+        for split in ("train", "validation", "test"):
+            count = counts[split]
+            patients_by_split_label[split][label] = shuffled[offset: offset + count]
+            offset += count
+
+    patient_splits = {
+        split: (
+            patients_by_split_label[split]["benign"]
+            + patients_by_split_label[split]["malignant"]
+        )
+        for split in ("train", "validation", "test")
+    }
+    patient_labels = {
+        patient_id: group["patient_label"]
+        for patient_id, group in patient_groups.items()
+    }
+
+    plan = {
+        "mode": "conditional_dp",
+        "seed": seed,
+        "source_manifest": str(Path(config["data_csv"])),
+        "patient_id_column": conditional_patient_id_column(config),
+        "split_fractions": fractions,
+        "selection_unit": "rows",
+        "selection_policy": "whole_patients_meet_or_exceed_row_targets",
+        "patients": patients_by_split_label,
+        "patient_splits": patient_splits,
+        "patient_labels": patient_labels,
+        "patient_counts": summarize_patient_splits(patient_splits, patient_labels),
+        "row_counts": summarize_patient_split_rows(patient_splits, patient_groups),
+        "available_train_patients": {
+            "benign": len(patients_by_split_label["train"]["benign"]),
+            "malignant": len(patients_by_split_label["train"]["malignant"]),
+        },
+    }
+    plan["available_train_rows"] = dict(plan["row_counts"]["train"])
+    plan["available_train_rows"].pop("total", None)
+    plan["run_selections"] = build_conditional_run_selections(
+        plan,
+        config,
+        patient_groups=patient_groups,
+    )
+    return plan
+
+
+def summarize_patient_splits(patient_splits, patient_labels):
+    summary = {}
+    for split, patient_ids in patient_splits.items():
+        labels = Counter(patient_labels[patient_id] for patient_id in patient_ids)
+        summary[split] = {
+            "total": len(patient_ids),
+            "benign": labels.get("benign", 0),
+            "malignant": labels.get("malignant", 0),
+        }
+    return summary
+
+
+def summarize_patient_split_rows(patient_splits, patient_groups):
+    summary = {}
+    for split, patient_ids in patient_splits.items():
+        label_counts = Counter()
+        total = 0
+        for patient_id in patient_ids:
+            group = patient_groups[patient_id]
+            total += group["row_count"]
+            label_counts.update(group["label_counts"])
+        summary[split] = {
+            "total": total,
+            "benign": label_counts.get("benign", 0),
+            "malignant": label_counts.get("malignant", 0),
+        }
+    return summary
+
+
+def conditional_split_plan_matches_config(split_plan, config):
+    expected = {
+        "mode": "conditional_dp",
+        "source_manifest": str(Path(config["data_csv"])),
+        "seed": int(config.get("conditional_dp", {}).get("split_seed", config.get("seed", 0))),
+        "patient_id_column": conditional_patient_id_column(config),
+        "split_fractions": parse_split_fractions(config),
+        "selection_unit": "rows",
+        "selection_policy": "whole_patients_meet_or_exceed_row_targets",
+    }
+    return all(split_plan.get(key) == value for key, value in expected.items())
+
+
+def ensure_conditional_run_metadata(rows, split_plan, config):
+    split_plan["selection_unit"] = "rows"
+    split_plan["selection_policy"] = "whole_patients_meet_or_exceed_row_targets"
+    split_plan["available_train_rows"] = available_train_row_counts(split_plan, rows=rows)
+    run_selections = build_conditional_run_selections(split_plan, config, rows=rows)
+    if split_plan.get("run_selections") == run_selections:
+        return False
+    split_plan["run_selections"] = run_selections
+    return True
+
+
+def build_conditional_run_selections(
+    split_plan,
+    config,
+    rows=None,
+    patient_groups=None,
+):
+    train_patients = split_plan["patients"]["train"]
+    row_counts_by_patient = conditional_train_patient_row_counts(
+        split_plan,
+        rows=rows,
+        patient_groups=patient_groups,
+    )
+
+    selections = {
+        "full_train": build_conditional_run_selection(
+            train_patients,
+            row_counts_by_patient,
+            n_plus=None,
+            rho=None,
+        )
+    }
+    for n_plus, rho in configured_conditional_run_pairs(config):
+        selections[conditional_run_key(n_plus, rho)] = build_conditional_run_selection(
+            train_patients,
+            row_counts_by_patient,
+            n_plus=n_plus,
+            rho=rho,
+        )
+    return selections
+
+
+def conditional_train_patient_row_counts(split_plan, rows=None, patient_groups=None):
+    train_patients = split_plan["patients"]["train"]
+    train_patient_ids = set(train_patients["benign"] + train_patients["malignant"])
+
+    if patient_groups is not None:
+        return {
+            patient_id: dict(patient_groups[patient_id]["label_counts"])
+            for patient_id in train_patient_ids
+        }
+
+    counts = {patient_id: Counter() for patient_id in train_patient_ids}
+    patient_id_column = split_plan["patient_id_column"]
+    for row in rows or []:
+        if str(row.get("model_split", "")).strip() != "train":
+            continue
+        patient_id = row_patient_id(row, patient_id_column)
+        if patient_id in counts:
+            counts[patient_id][normalized_label(row)] += 1
+    return {patient_id: dict(label_counts) for patient_id, label_counts in counts.items()}
+
+
+def available_train_row_counts(split_plan, rows=None, patient_groups=None):
+    train_patients = split_plan["patients"]["train"]
+    row_counts_by_patient = conditional_train_patient_row_counts(
+        split_plan,
+        rows=rows,
+        patient_groups=patient_groups,
+    )
+    counts = Counter()
+    for patient_id in train_patients["benign"] + train_patients["malignant"]:
+        counts.update(row_counts_by_patient.get(patient_id, {}))
+    return {
+        "benign": counts.get("benign", 0),
+        "malignant": counts.get("malignant", 0),
+    }
+
+
+def build_conditional_run_selection(
+    train_patients,
+    row_counts_by_patient,
+    n_plus,
+    rho,
+):
+    malignant_patients = list(train_patients["malignant"])
+    benign_patients = list(train_patients["benign"])
+    available_patients = {
+        "benign": len(benign_patients),
+        "malignant": len(malignant_patients),
+    }
+    available_row_counter = Counter()
+    for patient_id in benign_patients + malignant_patients:
+        available_row_counter.update(row_counts_by_patient.get(patient_id, {}))
+    available_rows = {
+        "benign": available_row_counter.get("benign", 0),
+        "malignant": available_row_counter.get("malignant", 0),
+    }
+
+    if n_plus is None:
+        resolved_n_plus = available_rows["malignant"]
+        requested_n_minus = available_rows["benign"]
+        resolved_n_minus = available_rows["benign"]
+        selected = {
+            "benign": benign_patients,
+            "malignant": malignant_patients,
+        }
+        return make_available_conditional_selection(
+            resolved_n_plus,
+            rho,
+            requested_n_minus,
+            resolved_n_minus,
+            available_patients,
+            available_rows,
+            capped_n_minus=False,
+            selected=selected,
+            row_counts_by_patient=row_counts_by_patient,
+        )
+
+    if n_plus > available_rows["malignant"]:
+        requested_n_minus = int(round(n_plus * rho))
+        return make_unavailable_conditional_selection(
+            n_plus,
+            rho,
+            requested_n_minus,
+            available_patients,
+            available_rows,
+            reason=(
+                f"Requested N_plus={n_plus} exceeds available malignant training "
+                f"rows={available_rows['malignant']}."
+            ),
+        )
+
+    selected_malignant = select_patients_to_meet_row_target(
+        malignant_patients,
+        row_counts_by_patient,
+        "malignant",
+        n_plus,
+    )
+    requested_n_minus = int(round(n_plus * rho))
+    feasible_n_minus = sum(
+        label_row_count(row_counts_by_patient, patient_id, "benign")
+        for patient_id in benign_patients + selected_malignant
+    )
+    resolved_n_minus = min(requested_n_minus, feasible_n_minus)
+    if resolved_n_minus <= 0:
+        return make_unavailable_conditional_selection(
+            n_plus,
+            rho,
+            requested_n_minus,
+            available_patients,
+            available_rows,
+            reason="Conditional DP subsampling selected no benign training patients.",
+        )
+
+    selected = {
+        "benign": select_patients_to_meet_row_target(
+            benign_patients,
+            row_counts_by_patient,
+            "benign",
+            resolved_n_minus,
+            initial_rows=sum(
+                label_row_count(row_counts_by_patient, patient_id, "benign")
+                for patient_id in selected_malignant
+            ),
+        ),
+        "malignant": selected_malignant,
+    }
+    return make_available_conditional_selection(
+        n_plus,
+        rho,
+        requested_n_minus,
+        resolved_n_minus,
+        available_patients,
+        available_rows,
+        capped_n_minus=requested_n_minus > feasible_n_minus,
+        selected=selected,
+        row_counts_by_patient=row_counts_by_patient,
+    )
+
+
+def select_patients_to_meet_row_target(
+    patient_ids,
+    row_counts_by_patient,
+    label,
+    target_rows,
+    initial_rows=0,
+):
+    selected = []
+    selected_rows = initial_rows
+    for patient_id in patient_ids:
+        if selected_rows >= target_rows:
+            break
+        selected.append(patient_id)
+        selected_rows += label_row_count(row_counts_by_patient, patient_id, label)
+    return selected
+
+
+def label_row_count(row_counts_by_patient, patient_id, label):
+    return int(row_counts_by_patient.get(patient_id, {}).get(label, 0))
+
+
+def make_available_conditional_selection(
+    n_plus,
+    rho,
+    requested_n_minus,
+    n_minus,
+    available_patients,
+    available_rows,
+    capped_n_minus,
+    selected,
+    row_counts_by_patient,
+):
+    row_counts = selected_row_counts(selected, row_counts_by_patient)
+    return {
+        "status": "available",
+        "count_unit": "rows",
+        "selection_policy": "whole_patients_meet_or_exceed_row_targets",
+        "requested_N_plus": n_plus,
+        "N_plus": n_plus,
+        "actual_N_plus": row_counts["malignant"],
+        "rho": json_number(rho) if rho is not None else None,
+        "requested_N_minus": requested_n_minus,
+        "resolved_N_minus": n_minus,
+        "N_minus": n_minus,
+        "actual_N_minus": row_counts["benign"],
+        "available_train_patients": dict(available_patients),
+        "available_train_rows": dict(available_rows),
+        "capped_N_minus": capped_n_minus,
+        "selected_patients": selected,
+        "selected_patient_counts": selected_patient_counts(selected),
+        "selected_row_counts": row_counts,
+    }
+
+
+def make_unavailable_conditional_selection(
+    n_plus,
+    rho,
+    requested_n_minus,
+    available_patients,
+    available_rows,
+    reason,
+):
+    selected = {"benign": [], "malignant": []}
+    return {
+        "status": "unavailable",
+        "reason": reason,
+        "count_unit": "rows",
+        "selection_policy": "whole_patients_meet_or_exceed_row_targets",
+        "requested_N_plus": n_plus,
+        "N_plus": n_plus,
+        "actual_N_plus": 0,
+        "rho": json_number(rho),
+        "requested_N_minus": requested_n_minus,
+        "resolved_N_minus": 0,
+        "N_minus": 0,
+        "actual_N_minus": 0,
+        "available_train_patients": dict(available_patients),
+        "available_train_rows": dict(available_rows),
+        "capped_N_minus": requested_n_minus > available_rows["benign"],
+        "selected_patients": selected,
+        "selected_patient_counts": selected_patient_counts(selected),
+        "selected_row_counts": {"total": 0, "benign": 0, "malignant": 0},
+    }
+
+
+def selected_patient_counts(selected):
+    benign = len(selected["benign"])
+    malignant = len(selected["malignant"])
+    return {
+        "total": benign + malignant,
+        "benign": benign,
+        "malignant": malignant,
+    }
+
+
+def selected_row_counts(selected, row_counts_by_patient):
+    labels = Counter()
+    for patient_id in selected["benign"] + selected["malignant"]:
+        labels.update(row_counts_by_patient.get(patient_id, {}))
+    return {
+        "total": sum(labels.values()),
+        "benign": labels.get("benign", 0),
+        "malignant": labels.get("malignant", 0),
+    }
+
+
+def configured_conditional_run_pairs(config):
+    n_plus_values = conditional_axis_values(
+        config,
+        ("N_plus_values", "n_plus_values", "N_plus", "n_plus"),
+        parse_positive_int,
+        "N_plus",
+    )
+    rho_values = conditional_axis_values(
+        config,
+        ("rho_values", "rho"),
+        parse_positive_float,
+        "rho",
+    )
+    pairs = []
+    for n_plus in n_plus_values:
+        for rho in rho_values:
+            pairs.append((n_plus, rho))
+
+    conditional_config = config.get("conditional_dp", {})
+    if any(
+        key in conditional_config
+        for key in ("active_N_plus", "active_n_plus", "active_rho")
+    ):
+        active = active_conditional_subset(config)
+        pairs.append((active["N_plus"], active["rho"]))
+    return unique_conditional_pairs(pairs)
+
+
+def conditional_axis_values(config, keys, parser, label):
+    conditional_config = config.get("conditional_dp", {})
+    values = []
+    for key in keys:
+        if key not in conditional_config:
+            continue
+        raw_values = conditional_config[key]
+        if isinstance(raw_values, (list, tuple)):
+            candidates = raw_values
+        else:
+            candidates = [raw_values]
+        for value in candidates:
+            values.append(parser(value, f"conditional_dp.{key}", label))
+    return unique_values(values)
+
+
+def parse_positive_int(value, key, label):
+    number = float(value)
+    if not number.is_integer():
+        raise ValueError(f"{key} {label} values must be integers.")
+    parsed = int(number)
+    if parsed <= 0:
+        raise ValueError(f"{key} {label} values must be > 0.")
+    return parsed
+
+
+def parse_positive_float(value, key, label):
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError(f"{key} {label} values must be > 0.")
+    return parsed
+
+
+def unique_values(values):
+    unique = []
+    seen = set()
+    for value in values:
+        key = json_number(value)
+        if key in seen:
+            continue
+        unique.append(value)
+        seen.add(key)
+    return unique
+
+
+def unique_conditional_pairs(pairs):
+    unique = []
+    seen = set()
+    for n_plus, rho in pairs:
+        key = (n_plus, json_number(rho))
+        if key in seen:
+            continue
+        unique.append((n_plus, rho))
+        seen.add(key)
+    return unique
+
+
+def conditional_run_key(n_plus, rho):
+    return f"N_plus_{n_plus}_rho_{axis_key_value(rho)}"
+
+
+def axis_key_value(value):
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}".replace("-", "m").replace(".", "p")
+
+
+def json_number(value):
+    number = float(value)
+    if number.is_integer():
+        return int(number)
+    return number
+
+
+def apply_conditional_dp_plan(rows, row_ids, patient_groups, split_plan):
+    patient_id_column = split_plan["patient_id_column"]
+    split_by_patient = {}
+    for split, patient_ids in split_plan["patient_splits"].items():
+        for patient_id in patient_ids:
+            split_by_patient[patient_id] = split
+
+    for row, sample_id in zip(rows, row_ids):
+        patient_id = str(row.get(patient_id_column, "")).strip()
+        if SOURCE_SPLIT_COLUMN not in row:
+            row[SOURCE_SPLIT_COLUMN] = row.get("model_split", "")
+        row["model_split"] = split_by_patient[patient_id]
+        row[CONDITIONAL_SAMPLE_ID_COLUMN] = sample_id
+        row[CONDITIONAL_PATIENT_ID_COLUMN] = patient_id
+        row[CONDITIONAL_PATIENT_LABEL_COLUMN] = patient_groups[patient_id]["patient_label"]
+
+
+def validate_conditional_dp_plan(rows, split_plan, config):
+    split_sets = {
+        split: set(patient_ids)
+        for split, patient_ids in split_plan["patient_splits"].items()
+    }
+    if (
+        split_sets["train"] & split_sets["validation"]
+        or split_sets["train"] & split_sets["test"]
+        or split_sets["validation"] & split_sets["test"]
+    ):
+        raise ValueError("Conditional DP patient splits must be mutually exclusive.")
+
+    all_split_patients = set().union(*split_sets.values())
+    if set(split_plan["patient_labels"]) != all_split_patients:
+        raise ValueError("Conditional DP patient_labels do not match patient_splits.")
+
+    row_counts = {
+        split: count_labels(row for row in rows if row.get("model_split") == split)
+        for split in ("train", "validation", "test")
+    }
+    empty_splits = [
+        split for split, counts in row_counts.items()
+        if counts["total"] == 0
+    ]
+    if empty_splits:
+        raise ValueError(f"Conditional DP split produced empty splits: {empty_splits}")
+    if row_counts["train"]["benign"] == 0 or row_counts["train"]["malignant"] == 0:
+        raise ValueError(
+            "Conditional DP training split must include both benign and malignant rows."
+        )
+
+    unavailable_without_reason = [
+        key
+        for key, selection in split_plan.get("run_selections", {}).items()
+        if selection.get("status") == "unavailable" and not selection.get("reason")
+    ]
+    if unavailable_without_reason:
+        raise ValueError(
+            "Conditional DP run selections are unavailable without reasons: "
+            f"{unavailable_without_reason}"
+        )
+
+
+def conditional_axis_scalar(config, primary_key, active_key):
+    conditional_config = config.get("conditional_dp", {})
+    if active_key in conditional_config:
+        return conditional_config[active_key]
+    value = conditional_config.get(primary_key)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        if len(value) == 1:
+            return value[0]
+        raise ValueError(
+            f"conditional_dp.{primary_key} contains multiple values. "
+            f"Set conditional_dp.{active_key} for a single training run."
+        )
+    return value
+
+
+def active_conditional_subset(config):
+    n_plus = conditional_axis_scalar(config, "N_plus", "active_N_plus")
+    if n_plus is None:
+        n_plus = conditional_axis_scalar(config, "n_plus", "active_n_plus")
+    rho = conditional_axis_scalar(config, "rho", "active_rho")
+    if n_plus is None and rho is None:
+        return None
+    if n_plus is None or rho is None:
+        raise ValueError(
+            "Conditional DP subsampling requires both N_plus and rho, or neither."
+        )
+    n_plus = int(n_plus)
+    rho = float(rho)
+    if n_plus <= 0:
+        raise ValueError("conditional_dp.N_plus must be > 0.")
+    if rho <= 0:
+        raise ValueError("conditional_dp.rho must be > 0.")
+    return {"N_plus": n_plus, "rho": rho}
+
+
+def conditional_train_patient_ids(split_plan, config):
+    subset = active_conditional_subset(config)
+    train_patients = split_plan["patients"]["train"]
+    if subset is None:
+        full_train = split_plan.get("run_selections", {}).get("full_train")
+        if full_train:
+            return selected_patient_id_set(full_train)
+        return set(train_patients["benign"] + train_patients["malignant"])
+
+    run_key = conditional_run_key(subset["N_plus"], subset["rho"])
+    selection = split_plan.get("run_selections", {}).get(run_key)
+    if selection is None:
+        raise ValueError(
+            "Conditional DP split plan is missing run selection "
+            f"{run_key!r}. Regenerate or reload the split plan."
+        )
+    if selection.get("status") != "available":
+        raise ValueError(selection.get("reason", f"Conditional DP run {run_key} is unavailable."))
+    return selected_patient_id_set(selection)
+
+
+def selected_patient_id_set(selection):
+    selected = selection["selected_patients"]
+    return set(selected["benign"] + selected["malignant"])
+
+
+def select_conditional_dp_rows(rows, split_plan, config):
+    patient_id_column = split_plan["patient_id_column"]
+    selected_train_patients = conditional_train_patient_ids(split_plan, config)
+    selected = {"train": [], "validation": [], "test": []}
+
+    for row in rows:
+        split = str(row.get("model_split", "")).strip()
+        if split not in selected:
+            continue
+        patient_id = row_patient_id(row, patient_id_column)
+        if split == "train" and patient_id not in selected_train_patients:
+            continue
+        selected[split].append(row)
+
+    return selected["train"], selected["validation"], selected["test"]
+
+
+def row_patient_id(row, patient_id_column):
+    patient_id = str(row.get(patient_id_column, "")).strip()
+    if patient_id:
+        return patient_id
+    return str(row.get(CONDITIONAL_PATIENT_ID_COLUMN, "")).strip()
 
 
 def build_shadow_attack_split_plan(rows, config):
@@ -464,6 +1307,22 @@ def write_csv_rows(path, rows):
                     if column not in ATTACK_MANIFEST_DROP_COLUMNS
                 }
             )
+
+
+def write_conditional_manifest_rows(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for column in row:
+            if column not in seen:
+                fieldnames.append(column)
+                seen.add(column)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def read_json(path):

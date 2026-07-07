@@ -54,6 +54,7 @@ workspace/
 
 # Local data and metadata exports
 data/
+conditional_dp/data/
 datasets/
 metadata/
 

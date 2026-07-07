@@ -1,0 +1,130 @@
+# Data configuration
+data_csv: "/home/wenytang/FL_projects/embed_data_full/data_handling_auto/model_data/site_filtered_manifest.csv"
+cleaned_data_root: "/mnt/c/Data/EMBED/embed_cleaned"
+workdir: "./conditional_dp/runs/convnext_tiny"
+
+input:
+  mode: "conditional_dp"
+  conditional_manifest: "./conditional_dp/data/derived_manifest.csv"
+  split_plan: "./conditional_dp/data/split_plan.json"
+  regenerate: false
+  validate_paths: true
+
+conditional_dp:
+  patient_id_column: "empi_anon"
+  split_fractions:
+    train: 0.70
+    validation: 0.10
+    test: 0.20
+  # For one row-count run, set both active_N_plus and active_rho.
+  # active_N_plus: 400
+  # active_rho: 50
+  N_plus_values: [200, 400, 800, 955]
+  rho_values: [1, 10, 50, 250]
+  output_root: "./conditional_dp"
+
+splits:
+  train: "train"
+  validation: "validation"
+  test: "test"
+
+seed: 0
+dataset: "Dataset"
+cache_rate: 1
+cache_dir: "./conditional_dp/cache/convnext_256_ras_scale_v1"
+
+dataloader:
+  batch_size: 128
+  num_workers: 10
+  shuffle: true
+  pin_memory: true
+
+epochs: 50
+val_interval: 1
+save_metric: "balanced_accuracy"
+
+checkpoint:
+  save_best: true
+  save_last: true
+
+differential_privacy:
+  enabled: false
+  accountant: "prv"
+  secure_mode: false
+  mode: "noise_multiplier"
+  noise_multiplier: 1.0
+  target_epsilon: null
+  target_delta: null
+  max_grad_norm: 1.0
+  poisson_sampling: true
+  clipping: "flat"
+  grad_sample_mode: "hooks"
+  fix_modules: true
+
+optimizer:
+  name: "Adam"
+  freeze_backbone: false
+  lr_backbone: 0.00001
+  lr_finetune: 0.0001
+  betas: [0.9, 0.999]
+  epsilon: 0.00000008
+  weight_decay: 0.00005
+
+loss:
+  name: "CrossEntropyLoss"
+  label_smoothing: 0.1
+  class_weights: true
+
+model:
+  name: "ConvNeXtTiny"
+  num_classes: 2
+  pretrained: true
+  dropout: 0.5
+
+train_transforms:
+  LoadImaged_im:
+    keys: ["image"]
+    ensure_channel_first: true
+  ScaleIntensityd:
+    keys: ["image"]
+  Orientationd:
+    keys: ["image"]
+    axcodes: "RAS"
+    as_closest_canonical: true
+  ResizeWithPadOrCropd:
+    keys: ["image"]
+    spatial_size: [256, 256]
+  RandFlipd_x:
+    keys: ["image"]
+    prob: 0.2
+    spatial_axis: 0
+  RandFlipd_y:
+    keys: ["image"]
+    prob: 0.2
+    spatial_axis: 1
+  RandRotated:
+    keys: ["image"]
+    prob: 0.2
+    range_x: [-0.8, 0.8]
+    range_y: [-0.8, 0.8]
+    mode: "bilinear"
+  RandAffined:
+    keys: ["image"]
+    prob: 0.2
+    rotate_range: [0.2]
+    scale_range: [0.2]
+    mode: "bilinear"
+
+eval_transforms:
+  LoadImaged_im:
+    keys: ["image"]
+    ensure_channel_first: true
+  ScaleIntensityd:
+    keys: ["image"]
+  Orientationd:
+    keys: ["image"]
+    axcodes: "RAS"
+    as_closest_canonical: true
+  ResizeWithPadOrCropd:
+    keys: ["image"]
+    spatial_size: [256, 256]
